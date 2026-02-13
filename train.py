@@ -10,6 +10,7 @@ from typing import Optional
 
 import torch
 import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 from disttrain.checkpoint import load_checkpoint, save_checkpoint
 from disttrain.config import ConfigError, RunConfig, load_config
@@ -143,27 +144,34 @@ def main() -> int:
             print(line)
 
     stage_cfg = cfg.stages[topology.local_stage_name]
-    model = build_stage_model(stage_cfg, cfg.training).to(device)
+    base_model = build_stage_model(stage_cfg, cfg.training).to(device)
     stage_lr = cfg.training.optimizer.stage_lrs.get(
         topology.local_stage_name,
         cfg.training.optimizer.lr,
     )
+    group_manager = ProcessGroupManager(topology)
+    group_manager.create()
+    group_manager.sync_parameters(base_model)
+    model = _wrap_model_with_ddp_if_needed(
+        model=base_model,
+        cfg=cfg,
+        topology=topology,
+        group_manager=group_manager,
+        device=device,
+    )
+
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        base_model.parameters(),
         lr=stage_lr,
         weight_decay=cfg.training.optimizer.weight_decay,
     )
     scaler = _build_scaler_if_needed(cfg, topology, device)
 
-    group_manager = ProcessGroupManager(topology)
-    group_manager.create()
-    group_manager.sync_parameters(model)
-
     start_step = 0
     if args.resume:
         start_step = load_checkpoint(
             args.resume,
-            model,
+            base_model,
             optimizer,
             scaler,
             topology,
@@ -220,6 +228,7 @@ def main() -> int:
                 "grad_norm": m.grad_norm,
                 "lr": m.lr,
                 "scaler_scale": m.scaler_scale,
+                "sync_impl": m.sync_impl,
                 "optimizer_step": m.optimizer_stepped,
             }
             if args.log_format == "json":
@@ -229,7 +238,7 @@ def main() -> int:
                     "[step={:04d}] loss={:.6f} step_time={:.3f}s fwd={:.3f}s bwd={:.3f}s "
                     "tokens/s={:.1f} samples/s={:.1f} comm={:.3f}s "
                     "(allr={:.3f},act_s={:.3f},act_r={:.3f},grad_s={:.3f},grad_r={:.3f},wait={:.3f}) "
-                    "bw={:.2f}MB/s grad_norm={} lr={:.6g} scaler={} bubble={:.4f} optimizer_step={}".format(
+                    "bw={:.2f}MB/s grad_norm={} lr={:.6g} scaler={} sync={} bubble={:.4f} optimizer_step={}".format(
                         payload["step"],
                         m.loss,
                         m.step_time_sec,
@@ -248,6 +257,7 @@ def main() -> int:
                         "n/a" if m.grad_norm is None else f"{m.grad_norm:.4f}",
                         m.lr,
                         "n/a" if m.scaler_scale is None else f"{m.scaler_scale:.1f}",
+                        m.sync_impl,
                         m.bubble_ratio,
                         m.optimizer_stepped,
                     )
@@ -266,7 +276,7 @@ def main() -> int:
         )
         save_checkpoint(
             path=str(ckpt_path),
-            model=model,
+            model=base_model,
             optimizer=optimizer,
             scaler=scaler,
             step=start_step + len(metrics),
@@ -304,6 +314,44 @@ def _build_scaler_if_needed(
     except Exception:
         # Backward compatibility path for older torch APIs.
         return torch.cuda.amp.GradScaler()
+
+
+def _wrap_model_with_ddp_if_needed(
+    model: torch.nn.Module,
+    cfg: RunConfig,
+    topology: Topology,
+    group_manager: ProcessGroupManager,
+    device: torch.device,
+) -> torch.nn.Module:
+    if not dist_ready():
+        return model
+    if topology.local_stage.dp_size <= 1:
+        return model
+    dp_group = group_manager.local_dp_group
+    if dp_group is None:
+        return model
+
+    bucket_cap_mb = cfg.distributed.grad_sync_bucket_mb
+    if bucket_cap_mb <= 0:
+        bucket_cap_mb = 0.001
+
+    kwargs = {
+        "process_group": dp_group,
+        "broadcast_buffers": False,
+        "bucket_cap_mb": bucket_cap_mb,
+        "gradient_as_bucket_view": True,
+    }
+    if device.type == "cuda":
+        kwargs["device_ids"] = [device.index]  # type: ignore[index]
+        kwargs["output_device"] = device.index
+
+    wrapped = DDP(model, **kwargs)
+    if topology.runtime_rank == 0:
+        print(
+            f"[INFO] enabled native DDP for stage={topology.local_stage_name}, "
+            f"dp={topology.local_stage.dp_size}, bucket_cap_mb={bucket_cap_mb}"
+        )
+    return wrapped
 
 
 if __name__ == "__main__":

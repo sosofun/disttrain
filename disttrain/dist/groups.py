@@ -120,6 +120,8 @@ class ProcessGroupManager:
         self,
         model: torch.nn.Module,
         bucket_mb: float = 25.0,
+        sync_tp: bool = True,
+        sync_dp: bool = True,
     ) -> Dict[str, float]:
         stats = {
             "time_sec": 0.0,
@@ -139,7 +141,7 @@ class ProcessGroupManager:
         if not grads:
             return stats
 
-        if stage.tp_size > 1:
+        if sync_tp and stage.tp_size > 1:
             tp_stats = self._all_reduce_bucketed(
                 grads,
                 group=tp_group,
@@ -149,7 +151,7 @@ class ProcessGroupManager:
             stats["time_sec"] += tp_stats["time_sec"]
             stats["bytes_mb"] += tp_stats["bytes_mb"]
 
-        if stage.dp_size > 1:
+        if sync_dp and stage.dp_size > 1:
             dp_stats = self._all_reduce_bucketed(
                 grads,
                 group=dp_group,

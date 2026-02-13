@@ -8,6 +8,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 from disttrain.config import RunConfig
 from disttrain.dist.groups import ProcessGroupManager
@@ -47,6 +48,7 @@ class StepMetrics:
     grad_norm: Optional[float]
     lr: float
     scaler_scale: Optional[float]
+    sync_impl: str
     optimizer_stepped: bool
 
 
@@ -79,6 +81,7 @@ class TrainingEngine:
         self.local_dp_idx = topology.local_dp_index()
         self.local_stage = topology.local_stage
         self.router = P2PRouter(topology)
+        self.use_ddp = isinstance(self.model, DDP)
         # Keep tensor refs together with work handles for async send lifetime.
         self.pending_works: List[Tuple[dist.Work, torch.Tensor]] = []
 
@@ -116,6 +119,18 @@ class TrainingEngine:
 
     def _transport_rank(self) -> bool:
         return self.local_tp_idx == 0
+
+    def _estimate_ddp_sync_bytes_mb(self) -> float:
+        if not self.use_ddp:
+            return 0.0
+        if self.local_stage.dp_size <= 1:
+            return 0.0
+        total_bytes = 0
+        for p in self.model.parameters():
+            if p.grad is None:
+                continue
+            total_bytes += p.grad.numel() * p.grad.element_size()
+        return float(total_bytes) / (1024.0 * 1024.0)
 
     def _record_comm(self, channel: str, elapsed_sec: float, tensor: torch.Tensor) -> None:
         self._step_comm_time_sec += elapsed_sec
@@ -449,21 +464,45 @@ class TrainingEngine:
             if self.device.type == "cuda":
                 torch.cuda.reset_peak_memory_stats(self.device)
 
-            t0 = time.perf_counter()
-            out = self._run_pipeline_step(step)
             should_step = (step + 1) % grad_accum_steps == 0
+            t0 = time.perf_counter()
+            if self.use_ddp and not should_step:
+                with self.model.no_sync():
+                    out = self._run_pipeline_step(step)
+            else:
+                out = self._run_pipeline_step(step)
             grad_norm_value: Optional[float] = None
             scaler_scale: Optional[float] = (
                 float(self.scaler.get_scale()) if self.scaler is not None else None
             )
             sync_stats = {"time_sec": 0.0, "bytes_mb": 0.0}
+            sync_impl = "none"
             if should_step:
                 if self.scaler is not None:
                     self.scaler.unscale_(self.optimizer)
-                sync_stats = self.group_manager.average_gradients(
-                    self.model,
-                    bucket_mb=self.config.distributed.grad_sync_bucket_mb,
-                )
+                if self.use_ddp:
+                    # DP gradients are synchronized by DDP hooks.
+                    sync_impl = "ddp"
+                    sync_stats["bytes_mb"] += self._estimate_ddp_sync_bytes_mb()
+                    # Keep TP synchronization explicit when tp_size > 1.
+                    tp_stats = self.group_manager.average_gradients(
+                        self.model,
+                        bucket_mb=self.config.distributed.grad_sync_bucket_mb,
+                        sync_tp=True,
+                        sync_dp=False,
+                    )
+                    sync_stats["time_sec"] += tp_stats["time_sec"]
+                    sync_stats["bytes_mb"] += tp_stats["bytes_mb"]
+                    if self.local_stage.tp_size > 1:
+                        sync_impl = "ddp+tp_manual"
+                else:
+                    sync_impl = "manual"
+                    sync_stats = self.group_manager.average_gradients(
+                        self.model,
+                        bucket_mb=self.config.distributed.grad_sync_bucket_mb,
+                        sync_tp=True,
+                        sync_dp=True,
+                    )
                 if self.config.training.grad_clip_norm > 0:
                     grad_norm = torch.nn.utils.clip_grad_norm_(
                         self.model.parameters(),
@@ -521,6 +560,7 @@ class TrainingEngine:
                     grad_norm=grad_norm_value,
                     lr=float(self.optimizer.param_groups[0].get("lr", 0.0)),
                     scaler_scale=scaler_scale,
+                    sync_impl=sync_impl,
                     optimizer_stepped=should_step,
                 )
             )
