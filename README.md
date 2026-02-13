@@ -92,6 +92,12 @@ GPipe vs 1F1B 自动基线对比（导出 json + md 报告）：
 bash scripts/run_benchmark_schedule_compare.sh
 ```
 
+SP 基线对比（LLM 阶段，`sequence_parallel on/off` 自动对比并导出报告）：
+
+```bash
+bash scripts/run_benchmark_sp_compare.sh
+```
+
 可选环境变量：
 
 - `STEPS=5`：每个 case 的训练步数

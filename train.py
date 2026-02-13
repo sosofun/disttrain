@@ -49,6 +49,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="do not restore RNG state when resuming from checkpoint",
     )
+    parser.add_argument(
+        "--log-all-ranks",
+        action="store_true",
+        help="emit metrics logs from all ranks (for benchmark/profiling)",
+    )
     return parser.parse_args()
 
 
@@ -124,6 +129,21 @@ def is_log_rank(topology: Topology) -> bool:
     )
 
 
+def should_log_rank(args: argparse.Namespace, topology: Topology) -> bool:
+    if args.log_all_ranks:
+        return True
+    return is_log_rank(topology)
+
+
+def rank_log_file_path(base_path: str, rank: int, log_all_ranks: bool) -> Path:
+    path = Path(base_path)
+    if not log_all_ranks:
+        return path
+    if path.suffix:
+        return path.with_name(f"{path.stem}.rank{rank}{path.suffix}")
+    return Path(str(path) + f".rank{rank}")
+
+
 def main() -> int:
     args = parse_args()
 
@@ -188,7 +208,7 @@ def main() -> int:
             topology,
             restore_rng=not args.no_restore_rng,
         )
-        if is_log_rank(topology):
+        if should_log_rank(args, topology):
             print(f"[INFO][rank={rank}] resumed from {args.resume}, step={start_step}")
 
     engine = TrainingEngine(
@@ -206,18 +226,25 @@ def main() -> int:
         max_steps = start_step + 1
 
     log_fp = None
-    if args.log_file and is_log_rank(topology):
-        log_path = Path(args.log_file)
+    if args.log_file and should_log_rank(args, topology):
+        log_path = rank_log_file_path(args.log_file, rank, args.log_all_ranks)
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_fp = log_path.open("a", encoding="utf-8")
 
     metrics = engine.run(max_steps=max_steps - start_step)
-    if is_log_rank(topology):
+    if should_log_rank(args, topology):
+        sp_enabled = bool(
+            cfg.stages[topology.local_stage_name].sequence_parallel
+            and topology.local_stage.tp_size > 1
+        )
         for m in metrics:
             payload = {
                 "step": start_step + m.step,
                 "rank": rank,
                 "stage": topology.local_stage_name,
+                "local_tp_idx": topology.local_tp_index(),
+                "local_dp_idx": topology.local_dp_index(),
+                "sequence_parallel": sp_enabled,
                 "loss": m.loss,
                 "step_time_sec": m.step_time_sec,
                 "forward_time_sec": m.forward_time_sec,
@@ -299,7 +326,7 @@ def main() -> int:
             config=cfg,
             topology=topology,
         )
-        if is_log_rank(topology):
+        if should_log_rank(args, topology):
             print(f"[INFO][rank={rank}] checkpoint saved: {ckpt_path}")
 
     group_manager.clear()

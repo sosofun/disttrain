@@ -78,6 +78,10 @@ _e2e_run_case() {
   local log_file="${log_dir}/${case_name}.log"
   local metrics_file="${log_dir}/${case_name}.metrics.jsonl"
   local log_format="${E2E_LOG_FORMAT:-json}"
+  local extra_args=()
+  if [[ -n "${E2E_EXTRA_ARGS:-}" ]]; then
+    read -r -a extra_args <<< "${E2E_EXTRA_ARGS}"
+  fi
   local cmd=(
     "${E2E_RUNNER[@]}"
     --standalone
@@ -87,6 +91,7 @@ _e2e_run_case() {
     --max-steps "${steps}"
     --log-format "${log_format}"
     --log-file "${metrics_file}"
+    "${extra_args[@]}"
   )
 
   echo "[INFO] >>> case=${case_name} nproc=${nproc} steps=${steps} config=${config_path}"
