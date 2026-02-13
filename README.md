@@ -98,6 +98,12 @@ bash scripts/run_e2e_zero1_dp_optim.sh
 bash scripts/run_e2e_1f1b_100_steps.sh
 ```
 
+可重复性检查（同 config + 同 seed + deterministic 运行两次，比较 metrics/ckpt 哈希）：
+
+```bash
+bash scripts/check_reproducibility.sh
+```
+
 GPipe vs 1F1B 自动基线对比（导出 json + md 报告）：
 
 ```bash
