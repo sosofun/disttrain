@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+E2E_RUNNER=()
+
 _e2e_repo_root() {
   local script_dir
   script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -10,10 +12,6 @@ _e2e_repo_root() {
 _e2e_check_prerequisites() {
   if ! command -v python3 >/dev/null 2>&1; then
     echo "[ERROR] python3 not found."
-    exit 1
-  fi
-  if ! command -v torchrun >/dev/null 2>&1; then
-    echo "[ERROR] torchrun not found. Please install PyTorch distributed tools."
     exit 1
   fi
 
@@ -31,6 +29,12 @@ if missing:
     print("        Example: pip install torch pyyaml")
     sys.exit(1)
 PY
+
+  if command -v torchrun >/dev/null 2>&1; then
+    E2E_RUNNER=(torchrun)
+  else
+    E2E_RUNNER=(python3 -m torch.distributed.run)
+  fi
 }
 
 _e2e_check_log() {
@@ -72,9 +76,10 @@ _e2e_run_case() {
 
   mkdir -p "${log_dir}"
   local log_file="${log_dir}/${case_name}.log"
-  local cmd=(torchrun --standalone --nproc_per_node="${nproc}" train.py --config "${config_path}" --max-steps "${steps}")
+  local cmd=("${E2E_RUNNER[@]}" --standalone --nproc_per_node="${nproc}" train.py --config "${config_path}" --max-steps "${steps}")
 
   echo "[INFO] >>> case=${case_name} nproc=${nproc} steps=${steps} config=${config_path}"
+  echo "[INFO] >>> runner=${E2E_RUNNER[*]}"
   local rc=0
   set +e
   if [[ "${force_cpu}" == "1" ]]; then
