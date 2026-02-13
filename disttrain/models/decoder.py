@@ -54,12 +54,16 @@ class DecoderModel(StageModel):
                 "image",
                 hidden_size=train_cfg.hidden_size,
                 image_size=train_cfg.image_size,
+                tp_size=tp_size,
+                tp_rank=tp_rank,
             )
         if "audio" in self.output_modalities:
             heads["audio"] = build_decoder_modality(
                 "audio",
                 hidden_size=train_cfg.hidden_size,
                 audio_length=train_cfg.audio_length,
+                tp_size=tp_size,
+                tp_rank=tp_rank,
             )
         self.heads = nn.ModuleDict(heads)
 
@@ -103,3 +107,6 @@ class DecoderModel(StageModel):
         self.text_head.set_tp_group(tp_group)  # type: ignore[arg-type]
         for block in self.blocks:
             block.set_tp_group(tp_group)
+        for head in self.heads.values():
+            if hasattr(head, "set_tp_group"):
+                head.set_tp_group(tp_group)  # type: ignore[misc]

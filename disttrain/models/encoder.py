@@ -54,6 +54,8 @@ class EncoderModel(StageModel):
                 "image",
                 hidden_size=train_cfg.hidden_size,
                 image_size=train_cfg.image_size,
+                tp_size=tp_size,
+                tp_rank=tp_rank,
             )
         if "video" in self.input_modalities:
             branches["video"] = build_encoder_modality(
@@ -61,12 +63,16 @@ class EncoderModel(StageModel):
                 hidden_size=train_cfg.hidden_size,
                 image_size=train_cfg.image_size,
                 frames=train_cfg.video_frames,
+                tp_size=tp_size,
+                tp_rank=tp_rank,
             )
         if "audio" in self.input_modalities:
             branches["audio"] = build_encoder_modality(
                 "audio",
                 hidden_size=train_cfg.hidden_size,
                 audio_length=train_cfg.audio_length,
+                tp_size=tp_size,
+                tp_rank=tp_rank,
             )
         self.branches = nn.ModuleDict(branches)
 
@@ -74,6 +80,9 @@ class EncoderModel(StageModel):
         self.text_embedding.set_tp_group(tp_group)  # type: ignore[arg-type]
         for block in self.blocks:
             block.set_tp_group(tp_group)
+        for branch in self.branches.values():
+            if hasattr(branch, "set_tp_group"):
+                branch.set_tp_group(tp_group)  # type: ignore[misc]
 
     def forward(
         self, inputs: TensorDict, meta: Optional[Dict[str, object]] = None
