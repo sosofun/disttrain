@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -87,16 +87,10 @@ class Zero1AdamW(Optimizer):
             device=self._device,
             dtype=torch.float32,
         )
-        self._main_grad_mask_padded = torch.zeros(
-            self._padded_numel,
-            device=self._device,
-            dtype=torch.bool,
-        )
 
         self._param_buffer = self._param_buffer_padded[: self._numel]
         self._main_param_buffer = self._main_param_buffer_padded[: self._numel]
         self._main_grad_buffer = self._main_grad_buffer_padded[: self._numel]
-        self._main_grad_mask = self._main_grad_mask_padded[: self._numel]
 
         # Build parameter views into contiguous parameter buffer.
         offset = 0
@@ -117,9 +111,7 @@ class Zero1AdamW(Optimizer):
         self._local_main_grad_shard = torch.zeros(
             self._shard_size, device=self._device, dtype=torch.float32
         )
-        self._local_grad_valid_mask = torch.zeros(
-            self._shard_size, device=self._device, dtype=torch.bool
-        )
+        self._local_active_ranges: List[Tuple[int, int]] = []
 
         # Adam states are sharded (fp32).
         self._exp_avg_shard = torch.zeros(
@@ -148,14 +140,25 @@ class Zero1AdamW(Optimizer):
         super().zero_grad(set_to_none=set_to_none)
         self._main_grad_buffer.zero_()
         self._main_grad_buffer_padded[self._numel :].zero_()
-        self._main_grad_mask.zero_()
-        self._main_grad_mask_padded[self._numel :] = False
         self._local_main_grad_shard.zero_()
-        self._local_grad_valid_mask.zero_()
+        self._local_active_ranges.clear()
+
+    def _mark_local_range_active(self, global_start: int, global_end: int) -> None:
+        start = max(global_start, self._local_start)
+        end = min(global_end, self._local_end)
+        if start >= end:
+            return
+        local_start = start - self._local_start
+        local_end = end - self._local_start
+        if self._local_active_ranges and self._local_active_ranges[-1][1] == local_start:
+            prev_start, _prev_end = self._local_active_ranges[-1]
+            self._local_active_ranges[-1] = (prev_start, local_end)
+            return
+        self._local_active_ranges.append((local_start, local_end))
 
     def _copy_model_grads_to_main_buffer(self) -> None:
         self._main_grad_buffer.zero_()
-        self._main_grad_mask.zero_()
+        self._local_active_ranges.clear()
         for item in self._param_slices:
             grad = item.param.grad
             if grad is None:
@@ -165,15 +168,12 @@ class Zero1AdamW(Optimizer):
             self._main_grad_buffer[item.start : item.end].copy_(
                 grad.detach().reshape(-1).to(torch.float32)
             )
-            self._main_grad_mask[item.start : item.end] = True
+            self._mark_local_range_active(item.start, item.end)
             # Release model grad memory after copy to fp32 main gradient buffer.
             item.param.grad = None
 
     def _reduce_scatter_main_grads(self) -> Dict[str, float]:
         stats = {"time_sec": 0.0, "bytes_mb": 0.0}
-        self._local_grad_valid_mask.copy_(
-            self._main_grad_mask_padded[self._local_start : self._local_end]
-        )
         if self.dp_world_size <= 1 or not self._distributed:
             self._local_main_grad_shard.copy_(
                 self._main_grad_buffer_padded[self._local_start : self._local_end]
@@ -215,32 +215,25 @@ class Zero1AdamW(Optimizer):
         eps = float(group["eps"])
         weight_decay = float(group["weight_decay"])
 
-        mask = self._local_grad_valid_mask
-        if not bool(mask.any()):
+        if not self._local_active_ranges:
             return
-
-        grad = self._local_main_grad_shard
-        old_exp_avg = self._exp_avg_shard
-        old_exp_avg_sq = self._exp_avg_sq_shard
-
-        exp_avg_new = old_exp_avg * beta1 + grad * (1.0 - beta1)
-        exp_avg_sq_new = old_exp_avg_sq * beta2 + grad * grad * (1.0 - beta2)
-        self._exp_avg_shard.copy_(torch.where(mask, exp_avg_new, old_exp_avg))
-        self._exp_avg_sq_shard.copy_(torch.where(mask, exp_avg_sq_new, old_exp_avg_sq))
 
         bias_correction1 = 1.0 - beta1**self._step
         bias_correction2 = 1.0 - beta2**self._step
         step_size = lr * (bias_correction2**0.5) / bias_correction1
 
-        denom = exp_avg_sq_new.sqrt().add_(eps)
-        update = exp_avg_new / denom
-        updated_param = self._local_main_param_shard
-        if weight_decay != 0.0:
-            updated_param = updated_param * (1.0 - lr * weight_decay)
-        updated_param = updated_param - step_size * update
-        self._local_main_param_shard.copy_(
-            torch.where(mask, updated_param, self._local_main_param_shard)
-        )
+        for start, end in self._local_active_ranges:
+            grad = self._local_main_grad_shard[start:end]
+            exp_avg = self._exp_avg_shard[start:end]
+            exp_avg_sq = self._exp_avg_sq_shard[start:end]
+            param = self._local_main_param_shard[start:end]
+
+            exp_avg.mul_(beta1).add_(grad, alpha=1.0 - beta1)
+            exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
+            denom = exp_avg_sq.sqrt().add_(eps)
+            if weight_decay != 0.0:
+                param.mul_(1.0 - lr * weight_decay)
+            param.addcdiv_(exp_avg, denom, value=-step_size)
 
     def _all_gather_updated_params(self) -> Dict[str, float]:
         stats = {"time_sec": 0.0, "bytes_mb": 0.0}
@@ -288,8 +281,7 @@ class Zero1AdamW(Optimizer):
 
         self._main_grad_buffer.zero_()
         self._main_grad_buffer_padded[self._numel :].zero_()
-        self._main_grad_mask.zero_()
-        self._main_grad_mask_padded[self._numel :] = False
+        self._local_active_ranges.clear()
 
         self.last_sync_stats = {
             "time_sec": float(rs_stats["time_sec"] + ag_stats["time_sec"]),
