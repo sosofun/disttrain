@@ -21,6 +21,14 @@ def _ceil_div(a: int, b: int) -> int:
 
 
 class _BufferBucket:
+    """
+    One dtype bucket of the distributed optimizer buffers.
+
+    Each bucket owns a contiguous parameter buffer (model dtype) and fp32
+    main-param/main-grad buffers, then runs the RS->local-step->AG cycle
+    independently. This keeps mixed precision parameters isolated by dtype.
+    """
+
     def __init__(
         self,
         *,
@@ -38,6 +46,7 @@ class _BufferBucket:
         self.param_slices: List[_ParamSlice] = []
 
         self.numel = sum(p.numel() for p in self.params)
+        # RS/AG requires equal-size shards, so we pad to world_size * shard_size.
         self.shard_size = _ceil_div(self.numel, self.dp_world_size)
         self.padded_numel = self.shard_size * self.dp_world_size
         self.local_start = self.dp_rank * self.shard_size
@@ -63,6 +72,8 @@ class _BufferBucket:
         self.main_param_buffer = self.main_param_buffer_padded[: self.numel]
         self.main_grad_buffer = self.main_grad_buffer_padded[: self.numel]
 
+        # Rebind module parameters to a contiguous storage so all-gather writes
+        # are immediately visible to model forward without per-parameter copies.
         offset = 0
         for p in self.params:
             n = p.numel()
@@ -81,6 +92,7 @@ class _BufferBucket:
         self.local_main_grad_shard = torch.zeros(
             self.shard_size, device=self.device, dtype=torch.float32
         )
+        # Sparse "active ranges" avoids a full bool mask buffer.
         self.local_active_ranges: List[Tuple[int, int]] = []
 
         self.exp_avg_shard = torch.zeros(
@@ -97,6 +109,7 @@ class _BufferBucket:
             return
         local_start = start - self.local_start
         local_end = end - self.local_start
+        # Merge adjacent segments to reduce loop iterations in local Adam update.
         if self.local_active_ranges and self.local_active_ranges[-1][1] == local_start:
             prev_start, _prev_end = self.local_active_ranges[-1]
             self.local_active_ranges[-1] = (prev_start, local_end)
@@ -123,6 +136,7 @@ class _BufferBucket:
                 grad.detach().reshape(-1).to(torch.float32)
             )
             self._mark_local_range_active(item.start, item.end)
+            # Free param.grad as soon as it is materialized in fp32 main-grad buffer.
             item.param.grad = None
 
     def reduce_scatter_main_grads(
@@ -153,6 +167,7 @@ class _BufferBucket:
         else:
             used_fallback = True
         if used_fallback:
+            # Compatibility path for older torch builds/backends.
             chunks = list(self.main_grad_buffer_padded.chunk(self.dp_world_size))
             dist.reduce_scatter(
                 output=self.local_main_grad_shard,
@@ -184,6 +199,7 @@ class _BufferBucket:
         step_size = lr * (bias_correction2**0.5) / bias_correction1
 
         for start, end in self.local_active_ranges:
+            # Only update ranges where this rank has real gradients after RS.
             grad = self.local_main_grad_shard[start:end]
             exp_avg = self.exp_avg_shard[start:end]
             exp_avg_sq = self.exp_avg_sq_shard[start:end]
@@ -214,6 +230,7 @@ class _BufferBucket:
         else:
             used_fallback = True
         if used_fallback:
+            # Compatibility path for older torch builds/backends.
             gather_chunks = list(self.param_buffer_padded.chunk(self.dp_world_size))
             dist.all_gather(gather_chunks, self.local_param_shard, group=dp_group)
 
@@ -327,6 +344,7 @@ class Zero1AdamW(Optimizer):
         self._validate_params(self._params)
         self._device = self._params[0].device
         dtype_groups = self._group_params_by_dtype(self._params)
+        # Build one buffer bucket per dtype to keep mixed-precision storage simple.
         self._buckets: List[_BufferBucket] = [
             _BufferBucket(
                 dtype=dtype,
@@ -449,6 +467,7 @@ class Zero1AdamW(Optimizer):
                 saved_map[key] = item
 
             for bucket in self._buckets:
+                # Match by (dtype, numel) so bucket order changes won't break restore.
                 key = (str(bucket.dtype), int(bucket.numel))
                 saved = saved_map.get(key)
                 if saved is None:

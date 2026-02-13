@@ -127,6 +127,8 @@ def _stage_topology_mismatch_suggestion(
 ) -> str:
     ck_world = ck_tp * ck_dp if ck_tp > 0 and ck_dp > 0 else -1
     rt_world = rt_tp * rt_dp if rt_tp > 0 and rt_dp > 0 else -1
+    # Same stage_world_size may be recoverable via offline TP/DP reshaping;
+    # different stage_world_size usually cannot be mapped losslessly.
     if ck_world == rt_world and ck_world > 0:
         return (
             f"建议：{stage_name} 的 stage_world_size 一致（{ck_world}），"

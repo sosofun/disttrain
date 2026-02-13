@@ -255,6 +255,7 @@ class RunConfig:
         loss_weights_raw = training_raw.get("loss_weights", {})
         if loss_weights_raw is None:
             loss_weights_raw = {}
+        # Start from defaults so users can override only a subset of tasks.
         loss_weights = {"text": 1.0, "image": 1.0, "audio": 1.0}
         for k, v in dict(loss_weights_raw).items():
             loss_weights[str(k)] = float(v)

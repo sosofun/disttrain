@@ -132,6 +132,8 @@ class TrainingEngine:
         return dist.is_available() and dist.is_initialized()
 
     def _transport_rank(self) -> bool:
+        # Each TP replica group uses tp_idx=0 as the cross-stage transport rank.
+        # Other TP ranks receive via intra-stage TP broadcast.
         return self.local_tp_idx == 0
 
     def _estimate_ddp_sync_bytes_mb(self) -> float:
@@ -321,6 +323,7 @@ class TrainingEngine:
             raise RuntimeError(
                 "all active output losses are disabled by zero weights in training.loss_weights"
             )
+        # Normalize by active weight sum so scaling remains stable when tasks are toggled.
         denom = sum(w for _name, _loss, w in active)
         total = sum(loss * w for _name, loss, w in active) / max(float(denom), 1e-12)
         return total / float(self.config.training.grad_accum_steps)
@@ -487,6 +490,7 @@ class TrainingEngine:
             if should_step:
                 zero_stage = int(getattr(self.optimizer, "zero_stage", 0))
                 if self.scaler is not None:
+                    # Clip/sync should see unscaled gradients.
                     self.scaler.unscale_(self.optimizer)
                 if self.use_ddp:
                     # DP gradients are synchronized by DDP hooks.
@@ -508,6 +512,7 @@ class TrainingEngine:
                         # Distributed optimizer handles DP sync via reduce-scatter/all-gather.
                         sync_impl = "zero1"
                         if self.local_stage.tp_size > 1:
+                            # ZeRO-1 replaces DP sync, but TP-replicated grads still need averaging.
                             tp_stats = self.group_manager.average_gradients(
                                 self.model,
                                 bucket_mb=self.config.distributed.grad_sync_bucket_mb,
@@ -538,6 +543,7 @@ class TrainingEngine:
                 else:
                     self.optimizer.step()
                 if zero_stage == 1:
+                    # Include optimizer-internal RS/AG traffic in communication accounting.
                     if sync_impl == "none":
                         sync_impl = "zero1"
                     elif "zero1" not in sync_impl:
