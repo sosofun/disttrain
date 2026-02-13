@@ -47,6 +47,33 @@ bash scripts/run_fake_data.sh local-llm
 bash scripts/run_fake_data.sh tri-stage-cpu
 ```
 
+## E2E 多进程 smoke / 回归脚本（torchrun + fake 数据）
+
+2-stage smoke（`encoder+llm` + `llm+decoder`）：
+
+```bash
+bash scripts/run_e2e_2stage_smoke.sh
+```
+
+3-stage smoke（`encoder+llm+decoder`）：
+
+```bash
+bash scripts/run_e2e_3stage_smoke.sh
+```
+
+一键 4 拓扑回归（更严格）：
+
+```bash
+bash scripts/run_e2e_all_topologies.sh
+```
+
+可选环境变量：
+
+- `STEPS=5`：每个 case 的训练步数
+- `FORCE_CPU=1`：默认开启，强制 CPU（避免 Gloo + CUDA 混用）
+- `TIMEOUT_SEC=240`：单 case 超时时间（秒）
+- `LOG_DIR=/path/to/logs`：日志输出目录
+
 ## 分布式启动示例
 
 纯文本 LLM（8 卡）：
