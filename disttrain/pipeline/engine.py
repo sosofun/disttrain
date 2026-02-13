@@ -3,7 +3,7 @@ from __future__ import annotations
 from contextlib import nullcontext
 from dataclasses import dataclass
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -62,7 +62,8 @@ class TrainingEngine:
         self.local_dp_idx = topology.local_dp_index()
         self.local_stage = topology.local_stage
         self.router = P2PRouter(topology)
-        self.pending_works: List[dist.Work] = []
+        # Keep tensor refs together with work handles for async send lifetime.
+        self.pending_works: List[Tuple[dist.Work, torch.Tensor]] = []
 
         precision = config.training.precision.lower()
         self.use_autocast = self.device.type == "cuda" and precision in {"bf16", "fp16"}
@@ -77,6 +78,8 @@ class TrainingEngine:
             pipeline_depth=self.pipeline_depth,
             num_micro_batches=self.config.pipeline.num_micro_batches,
         )
+        # 1F1B relies on non-blocking p2p to avoid cross-stage send/recv lockstep deadlocks.
+        self._force_async_p2p = self.config.pipeline.schedule == "1f1b"
 
         self._forward_hidden: Dict[int, torch.Tensor] = {}
         self._forward_inputs: Dict[int, torch.Tensor] = {}
@@ -174,11 +177,12 @@ class TrainingEngine:
         dst_rank = self.router.next_peer_rank(self.local_stage_name, self.local_dp_idx)
         if dst_rank is None:
             raise RuntimeError("next stage is missing for activation send")
+        use_async = self.config.pipeline.overlap_p2p_comm or self._force_async_p2p
         work = send_tensor(
-            tensor=hidden.detach(),
+            tensor=hidden,
             dst_rank=dst_rank,
             tag=activation_tag(step, micro_batch_idx),
-            async_op=self.config.pipeline.overlap_p2p_comm,
+            async_op=use_async,
         )
         if work is not None:
             self.pending_works.append(work)
@@ -216,11 +220,12 @@ class TrainingEngine:
         dst_rank = self.router.prev_peer_rank(self.local_stage_name, self.local_dp_idx)
         if dst_rank is None:
             raise RuntimeError("prev stage is missing for gradient send")
+        use_async = self.config.pipeline.overlap_p2p_comm or self._force_async_p2p
         work = send_tensor(
-            tensor=grad.detach(),
+            tensor=grad,
             dst_rank=dst_rank,
             tag=gradient_tag(step, micro_batch_idx),
-            async_op=self.config.pipeline.overlap_p2p_comm,
+            async_op=use_async,
         )
         if work is not None:
             self.pending_works.append(work)
@@ -319,7 +324,7 @@ class TrainingEngine:
             self._send_gradient(grad_in, step=step, micro_batch_idx=micro_batch_idx)
 
     def _wait_pending(self) -> None:
-        for work in self.pending_works:
+        for work, _payload in self.pending_works:
             work.wait()
         self.pending_works.clear()
 

@@ -81,12 +81,17 @@ def send_tensor(
     dst_rank: int,
     tag: int,
     async_op: bool = False,
-) -> Optional[dist.Work]:
+) -> Optional[Tuple[dist.Work, torch.Tensor]]:
     if not _is_dist_ready():
         return None
+    payload = tensor.detach().contiguous()
     if async_op:
-        return dist.isend(tensor=tensor, dst=dst_rank, tag=tag)
-    dist.send(tensor=tensor, dst=dst_rank, tag=tag)
+        # Keep a dedicated payload buffer to avoid lifetime issues when the
+        # original tensor is reused or released before async send completion.
+        payload = payload.clone()
+        work = dist.isend(tensor=payload, dst=dst_rank, tag=tag)
+        return work, payload
+    dist.send(tensor=payload, dst=dst_rank, tag=tag)
     return None
 
 
