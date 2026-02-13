@@ -16,6 +16,7 @@ RUN_ID="$(date +%Y%m%d_%H%M%S)"
 LOG_DIR="${LOG_DIR:-${REPO_ROOT}/artifacts/repro_check_${RUN_ID}}"
 CKPT1_DIR="${LOG_DIR}/ckpt_run1"
 CKPT2_DIR="${LOG_DIR}/ckpt_run2"
+STRICT="${STRICT:-1}"
 LOSS_ATOL="${LOSS_ATOL:-1e-12}"
 GRAD_NORM_ATOL="${GRAD_NORM_ATOL:-1e-12}"
 
@@ -28,6 +29,11 @@ fi
 
 mkdir -p "${LOG_DIR}" "${CKPT1_DIR}" "${CKPT2_DIR}"
 
+if [[ "${STRICT}" != "0" && "${STRICT}" != "1" ]]; then
+  echo "[ERROR] STRICT must be 0 or 1, got: ${STRICT}"
+  exit 1
+fi
+
 NPROC="$(python3 - "${CONFIG}" <<'PY'
 import sys
 import yaml
@@ -39,7 +45,7 @@ PY
 CASE1="repro-run1-${NPROC}p"
 CASE2="repro-run2-${NPROC}p"
 
-echo "[INFO] Reproducibility check start: config=${CONFIG}, nproc=${NPROC}, steps=${STEPS}, seed=${SEED}"
+echo "[INFO] Reproducibility check start: config=${CONFIG}, nproc=${NPROC}, steps=${STEPS}, seed=${SEED}, strict=${STRICT}"
 
 export E2E_EXTRA_ARGS="--deterministic --seed ${SEED} --checkpoint-dir ${CKPT1_DIR}"
 _e2e_run_case \
@@ -67,7 +73,7 @@ METRICS2="${LOG_DIR}/${CASE2}.metrics.jsonl"
 REPORT_JSON="${LOG_DIR}/repro_compare_report.json"
 REPORT_MD="${LOG_DIR}/repro_compare_report.md"
 
-python3 - "${METRICS1}" "${METRICS2}" "${CKPT1_DIR}" "${CKPT2_DIR}" "${LOSS_ATOL}" "${GRAD_NORM_ATOL}" "${REPORT_JSON}" "${REPORT_MD}" <<'PY'
+python3 - "${METRICS1}" "${METRICS2}" "${CKPT1_DIR}" "${CKPT2_DIR}" "${LOSS_ATOL}" "${GRAD_NORM_ATOL}" "${STRICT}" "${REPORT_JSON}" "${REPORT_MD}" <<'PY'
 import hashlib
 import json
 import math
@@ -83,8 +89,9 @@ ckpt1_dir = Path(sys.argv[3])
 ckpt2_dir = Path(sys.argv[4])
 loss_atol = float(sys.argv[5])
 grad_norm_atol = float(sys.argv[6])
-report_json = Path(sys.argv[7])
-report_md = Path(sys.argv[8])
+strict = int(sys.argv[7]) == 1
+report_json = Path(sys.argv[8])
+report_md = Path(sys.argv[9])
 
 
 def load_jsonl(path: Path):
@@ -152,15 +159,20 @@ def compare_metrics(rows1: list[dict[str, Any]], rows2: list[dict[str, Any]]) ->
                 raise SystemExit(
                     f"[ERROR] metric mismatch at row={i}, key={key}: {a.get(key)} != {b.get(key)}"
                 )
-        assert_close(a.get("loss"), b.get("loss"), loss_atol, "loss", i)
-        assert_close(a.get("grad_norm"), b.get("grad_norm"), grad_norm_atol, "grad_norm", i)
-        assert_close(a.get("lr"), b.get("lr"), 0.0, "lr", i)
-        assert_close(a.get("scaler_scale"), b.get("scaler_scale"), 0.0, "scaler_scale", i)
+        # Strict mode validates floating-point metric reproducibility.
+        # Non-strict mode only requires structural metrics + checkpoint digests.
+        if strict:
+            assert_close(a.get("loss"), b.get("loss"), loss_atol, "loss", i)
+            assert_close(a.get("grad_norm"), b.get("grad_norm"), grad_norm_atol, "grad_norm", i)
+            assert_close(a.get("lr"), b.get("lr"), 0.0, "lr", i)
+            assert_close(a.get("scaler_scale"), b.get("scaler_scale"), 0.0, "scaler_scale", i)
 
     optimizer_steps = sum(1 for r in rows1 if r.get("optimizer_step"))
     return {
         "rows": len(rows1),
         "optimizer_rows": optimizer_steps,
+        "strict": strict,
+        "float_metric_check": "enabled" if strict else "skipped",
         "loss_atol": loss_atol,
         "grad_norm_atol": grad_norm_atol,
     }
@@ -256,6 +268,8 @@ md = [
     "## Result",
     "",
     "- status: passed",
+    f"- strict mode: {metrics_summary['strict']}",
+    f"- float metric check: {metrics_summary['float_metric_check']}",
     f"- metrics rows: {metrics_summary['rows']}",
     f"- optimizer rows: {metrics_summary['optimizer_rows']}",
     f"- checkpoint files compared: {ckpt_summary['count']}",

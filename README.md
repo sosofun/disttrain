@@ -104,6 +104,12 @@ bash scripts/run_e2e_1f1b_100_steps.sh
 bash scripts/check_reproducibility.sh
 ```
 
+可重复性脚本常用参数：
+- `STRICT=1`：严格模式（默认），要求 metrics 浮点值与 ckpt 哈希都一致
+- `STRICT=0`：宽松模式，仅要求结构化 metrics 与 ckpt 哈希一致（跳过浮点 metrics 严格比较）
+- `LOSS_ATOL=1e-12`：严格模式下 loss 比较容差
+- `GRAD_NORM_ATOL=1e-12`：严格模式下 grad_norm 比较容差
+
 GPipe vs 1F1B 自动基线对比（导出 json + md 报告）：
 
 ```bash
