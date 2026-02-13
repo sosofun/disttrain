@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import unittest
 
-import torch
+try:
+    import torch
+except ModuleNotFoundError:  # pragma: no cover - environment dependent
+    torch = None
 
 from disttrain.config import load_config
 from disttrain.dist.groups import ProcessGroupManager
@@ -11,6 +14,7 @@ from disttrain.models.registry import build_stage_model
 from disttrain.pipeline.engine import TrainingEngine
 
 
+@unittest.skipIf(torch is None, "torch is not installed in current environment")
 class SmokeEngineTests(unittest.TestCase):
     def test_single_process_llm_only(self) -> None:
         cfg = load_config("configs/text_llm_only_local.yaml")
