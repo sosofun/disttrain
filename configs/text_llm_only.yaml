@@ -1,0 +1,35 @@
+distributed:
+  backend: nccl
+  world_size: 8
+  init_method: env://
+  timeout_sec: 1800
+
+stages:
+  encoder:
+    enabled: false
+  llm:
+    enabled: true
+    tp_size: 4
+    dp_size: 2
+    model_cls: LLMModel
+  decoder:
+    enabled: false
+
+pipeline:
+  schedule: 1f1b
+  num_micro_batches: 4
+  overlap_p2p_comm: false
+
+training:
+  global_batch_size: 256
+  micro_batch_size: 8
+  grad_accum_steps: 4
+  precision: bf16
+  max_steps: 100
+  seq_len: 128
+  vocab_size: 32000
+  hidden_size: 512
+  optimizer:
+    type: adamw
+    lr: 3.0e-4
+    weight_decay: 0.01
