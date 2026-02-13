@@ -76,7 +76,18 @@ _e2e_run_case() {
 
   mkdir -p "${log_dir}"
   local log_file="${log_dir}/${case_name}.log"
-  local cmd=("${E2E_RUNNER[@]}" --standalone --nproc_per_node="${nproc}" train.py --config "${config_path}" --max-steps "${steps}")
+  local metrics_file="${log_dir}/${case_name}.metrics.jsonl"
+  local log_format="${E2E_LOG_FORMAT:-json}"
+  local cmd=(
+    "${E2E_RUNNER[@]}"
+    --standalone
+    --nproc_per_node="${nproc}"
+    train.py
+    --config "${config_path}"
+    --max-steps "${steps}"
+    --log-format "${log_format}"
+    --log-file "${metrics_file}"
+  )
 
   echo "[INFO] >>> case=${case_name} nproc=${nproc} steps=${steps} config=${config_path}"
   echo "[INFO] >>> runner=${E2E_RUNNER[*]}"

@@ -36,9 +36,15 @@ class StepMetrics:
     comm_time_sec: float
     comm_bytes_mb: float
     comm_bandwidth_mb_s: float
+    comm_activation_send_sec: float
+    comm_activation_recv_sec: float
+    comm_gradient_send_sec: float
+    comm_gradient_recv_sec: float
+    comm_wait_sec: float
     gpu_mem_peak_mb: float
     grad_norm: Optional[float]
     lr: float
+    scaler_scale: Optional[float]
     optimizer_stepped: bool
 
 
@@ -50,6 +56,7 @@ class TrainingEngine:
         group_manager: ProcessGroupManager,
         model: StageModel,
         optimizer: torch.optim.Optimizer,
+        scaler: Optional[torch.amp.GradScaler],
         device: torch.device,
     ):
         self.config = config
@@ -57,6 +64,7 @@ class TrainingEngine:
         self.group_manager = group_manager
         self.model = model
         self.optimizer = optimizer
+        self.scaler = scaler
         self.device = device
 
         self.local_stage_name = topology.local_stage_name
@@ -93,6 +101,13 @@ class TrainingEngine:
         self._losses: Dict[int, torch.Tensor] = {}
         self._step_comm_time_sec = 0.0
         self._step_comm_bytes = 0
+        self._step_comm_breakdown = {
+            "act_send": 0.0,
+            "act_recv": 0.0,
+            "grad_send": 0.0,
+            "grad_recv": 0.0,
+            "wait": 0.0,
+        }
 
     def _dist_ready(self) -> bool:
         return dist.is_available() and dist.is_initialized()
@@ -100,9 +115,11 @@ class TrainingEngine:
     def _transport_rank(self) -> bool:
         return self.local_tp_idx == 0
 
-    def _record_comm(self, elapsed_sec: float, tensor: torch.Tensor) -> None:
+    def _record_comm(self, channel: str, elapsed_sec: float, tensor: torch.Tensor) -> None:
         self._step_comm_time_sec += elapsed_sec
         self._step_comm_bytes += tensor.numel() * tensor.element_size()
+        if channel in self._step_comm_breakdown:
+            self._step_comm_breakdown[channel] += elapsed_sec
 
     def _tp_broadcast(self, tensor: torch.Tensor) -> torch.Tensor:
         if not self._dist_ready() or self.local_stage.tp_size == 1:
@@ -179,7 +196,7 @@ class TrainingEngine:
                 tag=activation_tag(step, micro_batch_idx),
                 async_op=False,
             )
-            self._record_comm(time.perf_counter() - t0, tensor)
+            self._record_comm("act_recv", time.perf_counter() - t0, tensor)
         else:
             tensor = torch.empty(shape, dtype=torch.float32, device=self.device)
         self._tp_broadcast(tensor)
@@ -200,7 +217,7 @@ class TrainingEngine:
             tag=activation_tag(step, micro_batch_idx),
             async_op=use_async,
         )
-        self._record_comm(time.perf_counter() - t0, hidden)
+        self._record_comm("act_send", time.perf_counter() - t0, hidden)
         if work is not None:
             self.pending_works.append(work)
 
@@ -220,7 +237,7 @@ class TrainingEngine:
                 tag=gradient_tag(step, micro_batch_idx),
                 async_op=False,
             )
-            self._record_comm(time.perf_counter() - t0, grad)
+            self._record_comm("grad_recv", time.perf_counter() - t0, grad)
         else:
             grad = torch.empty(shape, dtype=torch.float32, device=self.device)
         self._tp_broadcast(grad)
@@ -247,7 +264,7 @@ class TrainingEngine:
             tag=gradient_tag(step, micro_batch_idx),
             async_op=use_async,
         )
-        self._record_comm(time.perf_counter() - t0, grad)
+        self._record_comm("grad_send", time.perf_counter() - t0, grad)
         if work is not None:
             self.pending_works.append(work)
 
@@ -327,12 +344,20 @@ class TrainingEngine:
     def _backward_micro_batch(self, step: int, micro_batch_idx: int) -> None:
         if self.is_last_stage:
             loss = self._losses[micro_batch_idx]
-            loss.backward()
+            if self.scaler is not None:
+                self.scaler.scale(loss).backward()
+            else:
+                loss.backward()
             if not self.is_first_stage:
                 grad_in = self._forward_inputs[micro_batch_idx].grad
                 if grad_in is None:
                     raise RuntimeError("missing input grad at sink stage")
-                self._send_gradient(grad_in, step=step, micro_batch_idx=micro_batch_idx)
+                if self.scaler is not None:
+                    scale = float(self.scaler.get_scale())
+                    grad_to_send = grad_in / max(scale, 1.0)
+                else:
+                    grad_to_send = grad_in
+                self._send_gradient(grad_to_send, step=step, micro_batch_idx=micro_batch_idx)
             return
 
         grad_out = self._recv_gradient(step=step, micro_batch_idx=micro_batch_idx)
@@ -349,7 +374,9 @@ class TrainingEngine:
         for work, _payload in self.pending_works:
             work.wait()
         if self.pending_works:
-            self._step_comm_time_sec += time.perf_counter() - t0
+            waited = time.perf_counter() - t0
+            self._step_comm_time_sec += waited
+            self._step_comm_breakdown["wait"] += waited
         self.pending_works.clear()
 
     def _run_pipeline_step(self, step: int) -> Dict[str, float]:
@@ -358,6 +385,13 @@ class TrainingEngine:
         self._losses.clear()
         self._step_comm_time_sec = 0.0
         self._step_comm_bytes = 0
+        self._step_comm_breakdown = {
+            "act_send": 0.0,
+            "act_recv": 0.0,
+            "grad_send": 0.0,
+            "grad_recv": 0.0,
+            "wait": 0.0,
+        }
 
         scheduler = PipelineScheduler(
             schedule=self.config.pipeline.schedule,
@@ -391,6 +425,11 @@ class TrainingEngine:
             "comm_time": comm_time,
             "comm_mb": comm_mb,
             "comm_bw": comm_bw,
+            "comm_act_send": self._step_comm_breakdown["act_send"],
+            "comm_act_recv": self._step_comm_breakdown["act_recv"],
+            "comm_grad_send": self._step_comm_breakdown["grad_send"],
+            "comm_grad_recv": self._step_comm_breakdown["grad_recv"],
+            "comm_wait": self._step_comm_breakdown["wait"],
         }
 
     def run(self, max_steps: int) -> List[StepMetrics]:
@@ -412,7 +451,12 @@ class TrainingEngine:
             out = self._run_pipeline_step(step)
             should_step = (step + 1) % grad_accum_steps == 0
             grad_norm_value: Optional[float] = None
+            scaler_scale: Optional[float] = (
+                float(self.scaler.get_scale()) if self.scaler is not None else None
+            )
             if should_step:
+                if self.scaler is not None:
+                    self.scaler.unscale_(self.optimizer)
                 self.group_manager.average_gradients(self.model)
                 if self.config.training.grad_clip_norm > 0:
                     grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -420,7 +464,12 @@ class TrainingEngine:
                         max_norm=self.config.training.grad_clip_norm,
                     )
                     grad_norm_value = float(grad_norm)
-                self.optimizer.step()
+                if self.scaler is not None:
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                    scaler_scale = float(self.scaler.get_scale())
+                else:
+                    self.optimizer.step()
 
             step_time = time.perf_counter() - t0
             tokens = (
@@ -452,9 +501,15 @@ class TrainingEngine:
                     comm_time_sec=float(out["comm_time"]),
                     comm_bytes_mb=float(out["comm_mb"]),
                     comm_bandwidth_mb_s=float(out["comm_bw"]),
+                    comm_activation_send_sec=float(out["comm_act_send"]),
+                    comm_activation_recv_sec=float(out["comm_act_recv"]),
+                    comm_gradient_send_sec=float(out["comm_grad_send"]),
+                    comm_gradient_recv_sec=float(out["comm_grad_recv"]),
+                    comm_wait_sec=float(out["comm_wait"]),
                     gpu_mem_peak_mb=gpu_mem_peak_mb,
                     grad_norm=grad_norm_value,
                     lr=float(self.optimizer.param_groups[0].get("lr", 0.0)),
+                    scaler_scale=scaler_scale,
                     optimizer_stepped=should_step,
                 )
             )

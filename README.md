@@ -41,6 +41,13 @@ python train.py --config configs/text_llm_only_local.yaml --max-steps 2
 python train.py --config configs/text_llm_only_local.yaml --max-steps 2 --log-format json
 ```
 
+将结构化日志落盘（json lines）：
+
+```bash
+python train.py --config configs/text_llm_only_local.yaml --max-steps 2 \
+  --log-format json --log-file artifacts/train_metrics.jsonl
+```
+
 或使用脚本（fake 数据）：
 
 ```bash
@@ -94,6 +101,12 @@ training:
       encoder: 1.5e-4
       llm: 2.0e-4
       decoder: 1.0e-4
+```
+
+Checkpoint 恢复时默认会恢复 RNG 状态（保证可复现），如需关闭可加：
+
+```bash
+python train.py --config configs/text_llm_only_local.yaml --resume ckpt.pt --no-restore-rng
 ```
 
 ## 分布式启动示例

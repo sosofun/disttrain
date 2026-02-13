@@ -6,6 +6,7 @@ from pathlib import Path
 import random
 import os
 import json
+from typing import Optional
 
 import torch
 import torch.distributed as dist
@@ -35,6 +36,17 @@ def parse_args() -> argparse.Namespace:
         choices=("text", "json"),
         default="text",
         help="training log output format",
+    )
+    parser.add_argument(
+        "--log-file",
+        type=str,
+        default="",
+        help="optional file path to append structured json logs",
+    )
+    parser.add_argument(
+        "--no-restore-rng",
+        action="store_true",
+        help="do not restore RNG state when resuming from checkpoint",
     )
     return parser.parse_args()
 
@@ -141,6 +153,7 @@ def main() -> int:
         lr=stage_lr,
         weight_decay=cfg.training.optimizer.weight_decay,
     )
+    scaler = _build_scaler_if_needed(cfg, topology, device)
 
     group_manager = ProcessGroupManager(topology)
     group_manager.create()
@@ -148,7 +161,14 @@ def main() -> int:
 
     start_step = 0
     if args.resume:
-        start_step = load_checkpoint(args.resume, model, optimizer, topology)
+        start_step = load_checkpoint(
+            args.resume,
+            model,
+            optimizer,
+            scaler,
+            topology,
+            restore_rng=not args.no_restore_rng,
+        )
         if is_log_rank(topology):
             print(f"[INFO][rank={rank}] resumed from {args.resume}, step={start_step}")
 
@@ -158,6 +178,7 @@ def main() -> int:
         group_manager=group_manager,
         model=model,
         optimizer=optimizer,
+        scaler=scaler,
         device=device,
     )
 
@@ -165,36 +186,49 @@ def main() -> int:
     if max_steps <= start_step:
         max_steps = start_step + 1
 
+    log_fp = None
+    if args.log_file and is_log_rank(topology):
+        log_path = Path(args.log_file)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_fp = log_path.open("a", encoding="utf-8")
+
     metrics = engine.run(max_steps=max_steps - start_step)
     if is_log_rank(topology):
         for m in metrics:
+            payload = {
+                "step": start_step + m.step,
+                "rank": rank,
+                "stage": topology.local_stage_name,
+                "loss": m.loss,
+                "step_time_sec": m.step_time_sec,
+                "forward_time_sec": m.forward_time_sec,
+                "backward_time_sec": m.backward_time_sec,
+                "tokens_per_sec": m.tokens_per_sec,
+                "samples_per_sec": m.samples_per_sec,
+                "bubble_ratio": m.bubble_ratio,
+                "comm_time_sec": m.comm_time_sec,
+                "comm_bytes_mb": m.comm_bytes_mb,
+                "comm_bandwidth_mb_s": m.comm_bandwidth_mb_s,
+                "comm_activation_send_sec": m.comm_activation_send_sec,
+                "comm_activation_recv_sec": m.comm_activation_recv_sec,
+                "comm_gradient_send_sec": m.comm_gradient_send_sec,
+                "comm_gradient_recv_sec": m.comm_gradient_recv_sec,
+                "comm_wait_sec": m.comm_wait_sec,
+                "gpu_mem_peak_mb": m.gpu_mem_peak_mb,
+                "grad_norm": m.grad_norm,
+                "lr": m.lr,
+                "scaler_scale": m.scaler_scale,
+                "optimizer_step": m.optimizer_stepped,
+            }
             if args.log_format == "json":
-                payload = {
-                    "step": start_step + m.step,
-                    "rank": rank,
-                    "stage": topology.local_stage_name,
-                    "loss": m.loss,
-                    "step_time_sec": m.step_time_sec,
-                    "forward_time_sec": m.forward_time_sec,
-                    "backward_time_sec": m.backward_time_sec,
-                    "tokens_per_sec": m.tokens_per_sec,
-                    "samples_per_sec": m.samples_per_sec,
-                    "bubble_ratio": m.bubble_ratio,
-                    "comm_time_sec": m.comm_time_sec,
-                    "comm_bytes_mb": m.comm_bytes_mb,
-                    "comm_bandwidth_mb_s": m.comm_bandwidth_mb_s,
-                    "gpu_mem_peak_mb": m.gpu_mem_peak_mb,
-                    "grad_norm": m.grad_norm,
-                    "lr": m.lr,
-                    "optimizer_step": m.optimizer_stepped,
-                }
                 print(json.dumps(payload, ensure_ascii=False))
             else:
                 print(
                     "[step={:04d}] loss={:.6f} step_time={:.3f}s fwd={:.3f}s bwd={:.3f}s "
-                    "tokens/s={:.1f} samples/s={:.1f} comm={:.3f}s bw={:.2f}MB/s "
-                    "grad_norm={} lr={:.6g} bubble={:.4f} optimizer_step={}".format(
-                        start_step + m.step,
+                    "tokens/s={:.1f} samples/s={:.1f} comm={:.3f}s "
+                    "(act_s={:.3f},act_r={:.3f},grad_s={:.3f},grad_r={:.3f},wait={:.3f}) "
+                    "bw={:.2f}MB/s grad_norm={} lr={:.6g} scaler={} bubble={:.4f} optimizer_step={}".format(
+                        payload["step"],
                         m.loss,
                         m.step_time_sec,
                         m.forward_time_sec,
@@ -202,13 +236,24 @@ def main() -> int:
                         m.tokens_per_sec,
                         m.samples_per_sec,
                         m.comm_time_sec,
+                        m.comm_activation_send_sec,
+                        m.comm_activation_recv_sec,
+                        m.comm_gradient_send_sec,
+                        m.comm_gradient_recv_sec,
+                        m.comm_wait_sec,
                         m.comm_bandwidth_mb_s,
                         "n/a" if m.grad_norm is None else f"{m.grad_norm:.4f}",
                         m.lr,
+                        "n/a" if m.scaler_scale is None else f"{m.scaler_scale:.1f}",
                         m.bubble_ratio,
                         m.optimizer_stepped,
                     )
                 )
+            if log_fp is not None:
+                log_fp.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+    if log_fp is not None:
+        log_fp.close()
 
     if args.checkpoint_dir:
         ckpt_dir = Path(args.checkpoint_dir)
@@ -220,6 +265,7 @@ def main() -> int:
             path=str(ckpt_path),
             model=model,
             optimizer=optimizer,
+            scaler=scaler,
             step=start_step + len(metrics),
             config=cfg,
             topology=topology,
@@ -232,6 +278,29 @@ def main() -> int:
         dist.barrier()
         dist.destroy_process_group()
     return 0
+
+
+def _build_scaler_if_needed(
+    cfg: RunConfig,
+    topology: Topology,
+    device: torch.device,
+) -> Optional[torch.amp.GradScaler]:
+    """
+    Build a scaler only for fp16 sink stage. For pipeline training this keeps scale
+    ownership clear and avoids non-sink stages maintaining unused scaler states.
+    """
+    is_sink_stage = topology.local_stage_name == topology.enabled_stage_names[-1]
+    if not is_sink_stage:
+        return None
+    if device.type != "cuda":
+        return None
+    if cfg.training.precision != "fp16":
+        return None
+    try:
+        return torch.amp.GradScaler("cuda")
+    except Exception:
+        # Backward compatibility path for older torch APIs.
+        return torch.cuda.amp.GradScaler()
 
 
 if __name__ == "__main__":

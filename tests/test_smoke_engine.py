@@ -31,6 +31,7 @@ class SmokeEngineTests(unittest.TestCase):
             group_manager=groups,
             model=model,
             optimizer=optimizer,
+            scaler=None,
             device=torch.device("cpu"),
         )
         metrics = engine.run(max_steps=2)
