@@ -113,6 +113,7 @@ class ConfigTopologyTests(unittest.TestCase):
         cfg = RunConfig.from_dict(raw)
         self.assertEqual(cfg.distributed.grad_sync_bucket_mb, 12)
         self.assertTrue(cfg.stages["llm"].activation_checkpoint)
+        self.assertTrue(cfg.training.io.enable_prefetch)
 
 
 if __name__ == "__main__":

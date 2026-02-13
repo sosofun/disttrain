@@ -86,6 +86,12 @@ DDP DP 同步专项回归（2 进程 LLM-only，校验 `sync_impl=ddp`）：
 bash scripts/run_e2e_ddp_dp_sync.sh
 ```
 
+GPipe vs 1F1B 自动基线对比（导出 json + md 报告）：
+
+```bash
+bash scripts/run_benchmark_schedule_compare.sh
+```
+
 可选环境变量：
 
 - `STEPS=5`：每个 case 的训练步数
@@ -117,6 +123,16 @@ python train.py --config configs/text_llm_only_local.yaml --resume ckpt.pt --no-
 
 - `distributed.grad_sync_bucket_mb`：梯度 all-reduce bucket 大小（MB，`0` 表示按参数逐个同步）
 - `stages.<stage>.activation_checkpoint`：按阶段启用 activation checkpoint（true/false）
+- `training.io`：I/O 占位优化开关（prefetch/pin_memory）：
+
+```yaml
+training:
+  io:
+    enable_prefetch: true
+    prefetch_size: 2
+    pin_memory: true
+    num_workers: 0
+```
 
 ## 分布式启动示例
 

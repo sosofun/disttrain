@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from disttrain.config import RunConfig
+from disttrain.data import FakeBatchProvider
 from disttrain.dist.groups import ProcessGroupManager
 from disttrain.dist.p2p import (
     P2PRouter,
@@ -39,6 +40,8 @@ class StepMetrics:
     comm_bandwidth_mb_s: float
     comm_allreduce_sec: float
     comm_allreduce_mb: float
+    dataloader_wait_sec: float
+    host_to_device_sec: float
     comm_activation_send_sec: float
     comm_activation_recv_sec: float
     comm_gradient_send_sec: float
@@ -106,6 +109,8 @@ class TrainingEngine:
         self._losses: Dict[int, torch.Tensor] = {}
         self._step_comm_time_sec = 0.0
         self._step_comm_bytes = 0
+        self._step_dataloader_wait_sec = 0.0
+        self._step_h2d_sec = 0.0
         self._step_comm_breakdown = {
             "act_send": 0.0,
             "act_recv": 0.0,
@@ -113,6 +118,15 @@ class TrainingEngine:
             "grad_recv": 0.0,
             "wait": 0.0,
         }
+        self.source_provider: Optional[FakeBatchProvider] = None
+        if self.is_first_stage:
+            self.source_provider = FakeBatchProvider(
+                training=self.config.training,
+                input_modalities=self.topology.stages[self.local_stage_name].input_modalities,
+                device=self.device,
+                dp_size=self.local_stage.dp_size,
+                dp_rank=self.local_dp_idx,
+            )
 
     def _dist_ready(self) -> bool:
         return dist.is_available() and dist.is_initialized()
@@ -149,45 +163,23 @@ class TrainingEngine:
         return tensor
 
     def _make_source_inputs(self) -> TensorDict:
-        cfg = self.config.training
-        batch_size = cfg.micro_batch_size
-        seq_len = cfg.seq_len
-
-        batch: TensorDict = {
-            "text_tokens": torch.randint(
-                low=0,
-                high=cfg.vocab_size,
-                size=(batch_size, seq_len),
-                device=self.device,
-                dtype=torch.long,
-            )
-        }
-
-        input_modalities = self.topology.stages[self.local_stage_name].input_modalities
-        if "image" in input_modalities:
-            batch["image"] = torch.randn(
-                batch_size,
-                3,
-                cfg.image_size,
-                cfg.image_size,
-                device=self.device,
-            )
-        if "video" in input_modalities:
-            batch["video"] = torch.randn(
-                batch_size,
-                cfg.video_frames,
-                3,
-                cfg.image_size,
-                cfg.image_size,
-                device=self.device,
-            )
-        if "audio" in input_modalities:
-            batch["audio"] = torch.randn(
-                batch_size,
-                1,
-                cfg.audio_length,
-                device=self.device,
-            )
+        if self.source_provider is not None:
+            batch, io_stats = self.source_provider.next_batch()
+            self._step_dataloader_wait_sec += float(io_stats.get("dataloader_wait_sec", 0.0))
+            self._step_h2d_sec += float(io_stats.get("host_to_device_sec", 0.0))
+        else:
+            cfg = self.config.training
+            batch_size = cfg.micro_batch_size
+            seq_len = cfg.seq_len
+            batch = {
+                "text_tokens": torch.randint(
+                    low=0,
+                    high=cfg.vocab_size,
+                    size=(batch_size, seq_len),
+                    device=self.device,
+                    dtype=torch.long,
+                )
+            }
 
         # Keep TP replicas consistent.
         if self._dist_ready() and self.local_stage.tp_size > 1:
@@ -402,6 +394,8 @@ class TrainingEngine:
         self._losses.clear()
         self._step_comm_time_sec = 0.0
         self._step_comm_bytes = 0
+        self._step_dataloader_wait_sec = 0.0
+        self._step_h2d_sec = 0.0
         self._step_comm_breakdown = {
             "act_send": 0.0,
             "act_recv": 0.0,
@@ -447,6 +441,8 @@ class TrainingEngine:
             "comm_grad_send": self._step_comm_breakdown["grad_send"],
             "comm_grad_recv": self._step_comm_breakdown["grad_recv"],
             "comm_wait": self._step_comm_breakdown["wait"],
+            "dataloader_wait": self._step_dataloader_wait_sec,
+            "host_to_device": self._step_h2d_sec,
         }
 
     def run(self, max_steps: int) -> List[StepMetrics]:
@@ -551,6 +547,8 @@ class TrainingEngine:
                     comm_bandwidth_mb_s=total_comm_bw,
                     comm_allreduce_sec=float(sync_stats["time_sec"]),
                     comm_allreduce_mb=float(sync_stats["bytes_mb"]),
+                    dataloader_wait_sec=float(out["dataloader_wait"]),
+                    host_to_device_sec=float(out["host_to_device"]),
                     comm_activation_send_sec=float(out["comm_act_send"]),
                     comm_activation_recv_sec=float(out["comm_act_recv"]),
                     comm_gradient_send_sec=float(out["comm_grad_send"]),

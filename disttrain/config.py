@@ -71,7 +71,17 @@ class TrainingConfig:
     image_size: int = 64
     video_frames: int = 8
     audio_length: int = 2048
+    data_seed: int = 2026
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
+    io: "IOConfig" = field(default_factory=lambda: IOConfig())
+
+
+@dataclass
+class IOConfig:
+    enable_prefetch: bool = True
+    prefetch_size: int = 2
+    pin_memory: bool = True
+    num_workers: int = 0
 
 
 @dataclass
@@ -141,6 +151,8 @@ class RunConfig:
             raise ConfigError("training.hidden_size must be >= 1")
         if self.training.seq_len < 1:
             raise ConfigError("training.seq_len must be >= 1")
+        if self.training.data_seed < 0:
+            raise ConfigError("training.data_seed must be >= 0")
         if self.training.grad_clip_norm < 0:
             raise ConfigError("training.grad_clip_norm must be >= 0")
         if self.training.device not in {"auto", "cpu", "cuda"}:
@@ -148,6 +160,10 @@ class RunConfig:
                 "training.device must be one of {'auto','cpu','cuda'}, "
                 f"got {self.training.device}"
             )
+        if self.training.io.prefetch_size < 0:
+            raise ConfigError("training.io.prefetch_size must be >= 0")
+        if self.training.io.num_workers < 0:
+            raise ConfigError("training.io.num_workers must be >= 0")
 
         if self.training.optimizer.type.lower() != "adamw":
             raise ConfigError("training.optimizer.type currently only supports 'adamw'")
@@ -183,6 +199,7 @@ class RunConfig:
             overlap_p2p_comm=bool(pipeline_raw.get("overlap_p2p_comm", True)),
         )
         optimizer_raw = training_raw.get("optimizer", {})
+        io_raw = training_raw.get("io", {})
         optimizer = OptimizerConfig(
             type=str(optimizer_raw.get("type", "adamw")),
             lr=float(optimizer_raw.get("lr", 2e-4)),
@@ -191,6 +208,12 @@ class RunConfig:
                 str(k): float(v)
                 for k, v in (optimizer_raw.get("stage_lrs", {}) or {}).items()
             },
+        )
+        io_cfg = IOConfig(
+            enable_prefetch=bool(io_raw.get("enable_prefetch", True)),
+            prefetch_size=int(io_raw.get("prefetch_size", 2)),
+            pin_memory=bool(io_raw.get("pin_memory", True)),
+            num_workers=int(io_raw.get("num_workers", 0)),
         )
         training = TrainingConfig(
             global_batch_size=int(training_raw.get("global_batch_size", 256)),
@@ -206,7 +229,9 @@ class RunConfig:
             image_size=int(training_raw.get("image_size", 64)),
             video_frames=int(training_raw.get("video_frames", 8)),
             audio_length=int(training_raw.get("audio_length", 2048)),
+            data_seed=int(training_raw.get("data_seed", 2026)),
             optimizer=optimizer,
+            io=io_cfg,
         )
 
         stages: Dict[str, StageConfig] = {}

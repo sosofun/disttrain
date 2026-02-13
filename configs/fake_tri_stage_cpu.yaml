@@ -36,6 +36,7 @@ training:
   grad_accum_steps: 1
   precision: fp32
   device: cpu
+  data_seed: 2026
   max_steps: 5
   seq_len: 24
   vocab_size: 2048
@@ -43,6 +44,11 @@ training:
   image_size: 16
   video_frames: 4
   audio_length: 256
+  io:
+    enable_prefetch: true
+    prefetch_size: 2
+    pin_memory: true
+    num_workers: 0
   optimizer:
     type: adamw
     lr: 1.0e-3
