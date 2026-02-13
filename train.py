@@ -55,6 +55,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="emit metrics logs from all ranks (for benchmark/profiling)",
     )
+    parser.add_argument(
+        "--deterministic",
+        action="store_true",
+        help="force deterministic algorithms and backend behavior",
+    )
     return parser.parse_args()
 
 
@@ -75,6 +80,20 @@ def setup_seed(seed: int, rank: int) -> None:
     torch.manual_seed(final_seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(final_seed)
+
+
+def configure_determinism(enabled: bool) -> None:
+    if not enabled:
+        return
+    # Required by some CUDA deterministic GEMM kernels.
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    torch.use_deterministic_algorithms(True)
+    if hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.allow_tf32 = False
+    if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
+        torch.backends.cuda.matmul.allow_tf32 = False
 
 
 def init_distributed(config: RunConfig) -> tuple[int, int, int, torch.device]:
@@ -161,8 +180,14 @@ def main() -> int:
         print(f"[ERROR] config error: {exc}")
         return 2
 
+    if args.deterministic:
+        cfg.training.deterministic = True
+    configure_determinism(cfg.training.deterministic)
+
     world_size, rank, _, device = init_distributed(cfg)
     setup_seed(args.seed, rank)
+    if rank == 0 and cfg.training.deterministic:
+        print("[INFO] deterministic mode enabled (torch/cudnn/cublas/tf32 configured)")
 
     try:
         topology = Topology(cfg, runtime_world_size=world_size, runtime_rank=rank)

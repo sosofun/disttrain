@@ -67,6 +67,7 @@ class TrainingConfig:
     grad_clip_norm: float = 1.0
     precision: str = "bf16"
     device: str = "auto"
+    deterministic: bool = False
     max_steps: int = 50
     seq_len: int = 128
     vocab_size: int = 32000
@@ -282,6 +283,7 @@ class RunConfig:
             grad_clip_norm=float(training_raw.get("grad_clip_norm", 1.0)),
             precision=str(training_raw.get("precision", "bf16")).lower(),
             device=str(training_raw.get("device", "auto")).lower(),
+            deterministic=bool(training_raw.get("deterministic", False)),
             max_steps=int(training_raw.get("max_steps", 50)),
             seq_len=int(training_raw.get("seq_len", 128)),
             vocab_size=int(training_raw.get("vocab_size", 32000)),

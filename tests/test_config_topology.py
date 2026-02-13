@@ -242,6 +242,25 @@ class ConfigTopologyTests(unittest.TestCase):
         with self.assertRaises(ConfigError):
             RunConfig.from_dict(raw)
 
+    def test_deterministic_flag_parse(self) -> None:
+        raw = {
+            "distributed": {"world_size": 1, "backend": "gloo"},
+            "stages": {
+                "encoder": {"enabled": False},
+                "llm": {"enabled": True, "tp_size": 1, "dp_size": 1, "model_cls": "LLMModel"},
+                "decoder": {"enabled": False},
+            },
+            "pipeline": {"schedule": "gpipe", "num_micro_batches": 2},
+            "training": {
+                "micro_batch_size": 2,
+                "hidden_size": 64,
+                "seq_len": 16,
+                "deterministic": True,
+            },
+        }
+        cfg = RunConfig.from_dict(raw)
+        self.assertTrue(cfg.training.deterministic)
+
 
 if __name__ == "__main__":
     unittest.main()

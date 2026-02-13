@@ -148,7 +148,16 @@ python train.py --config configs/text_llm_only_local.yaml --resume ckpt.pt --no-
 - PyTorch CPU RNG
 - PyTorch CUDA RNG（`torch.cuda.get_rng_state_all`）
 
+如需进一步降低算子层面的非确定性，可启用 deterministic 模式：
+
+```bash
+python train.py --config configs/text_llm_only_local.yaml --deterministic
+```
+
 - `distributed.grad_sync_bucket_mb`：梯度 all-reduce bucket 大小（MB，`0` 表示按参数逐个同步）
+- `training.deterministic`：是否启用确定性模式（默认 `false`）
+  - 开启后会设置 `torch.use_deterministic_algorithms(True)`、`cudnn.deterministic=True`、
+    `cudnn.benchmark=False`、关闭 TF32，并设置 `CUBLAS_WORKSPACE_CONFIG=:4096:8`
 - `training.optimizer.zero_stage`：优化器分片等级，当前支持：
   - `0`：常规 AdamW（默认）
   - `1`：ZeRO-1 Distributed Optimizer（连续参数/主梯度 buffer + `reduce_scatter/all_gather`）
