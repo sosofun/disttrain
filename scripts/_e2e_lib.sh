@@ -57,8 +57,8 @@ for marker in bad_markers:
         print(f"[ERROR] log contains failure marker: {marker}")
         sys.exit(1)
 
-if "[step=" not in text:
-    print("[ERROR] log does not contain training step metrics.")
+if "[step=" not in text and '"step":' not in text:
+    print("[ERROR] log does not contain training step metrics (text/json).")
     sys.exit(1)
 
 print("[INFO] log validation passed:", log_path)

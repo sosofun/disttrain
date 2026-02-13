@@ -51,6 +51,7 @@ class OptimizerConfig:
     type: str = "adamw"
     lr: float = 2e-4
     weight_decay: float = 0.01
+    stage_lrs: Dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
@@ -58,6 +59,7 @@ class TrainingConfig:
     global_batch_size: int = 256
     micro_batch_size: int = 4
     grad_accum_steps: int = 1
+    grad_clip_norm: float = 1.0
     precision: str = "bf16"
     device: str = "auto"
     max_steps: int = 50
@@ -110,6 +112,13 @@ class RunConfig:
             )
         if self.pipeline.num_micro_batches < 1:
             raise ConfigError("pipeline.num_micro_batches must be >= 1")
+        pipeline_depth = len(self.enabled_stages)
+        if self.pipeline.num_micro_batches < pipeline_depth:
+            raise ConfigError(
+                "pipeline.num_micro_batches must be >= enabled stage count: "
+                f"num_micro_batches={self.pipeline.num_micro_batches}, "
+                f"enabled_stage_count={pipeline_depth}"
+            )
 
         if self.distributed.world_size in (0, None):
             self.distributed.world_size = self.expected_world_size
@@ -128,6 +137,8 @@ class RunConfig:
             raise ConfigError("training.hidden_size must be >= 1")
         if self.training.seq_len < 1:
             raise ConfigError("training.seq_len must be >= 1")
+        if self.training.grad_clip_norm < 0:
+            raise ConfigError("training.grad_clip_norm must be >= 0")
         if self.training.device not in {"auto", "cpu", "cuda"}:
             raise ConfigError(
                 "training.device must be one of {'auto','cpu','cuda'}, "
@@ -136,6 +147,17 @@ class RunConfig:
 
         if self.training.optimizer.type.lower() != "adamw":
             raise ConfigError("training.optimizer.type currently only supports 'adamw'")
+        for k, v in self.training.optimizer.stage_lrs.items():
+            if k not in STAGE_ORDER:
+                raise ConfigError(
+                    "training.optimizer.stage_lrs contains invalid stage key "
+                    f"'{k}', expected one of {list(STAGE_ORDER)}"
+                )
+            if v <= 0:
+                raise ConfigError(
+                    "training.optimizer.stage_lrs values must be > 0, "
+                    f"got {k}={v}"
+                )
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any]) -> "RunConfig":
@@ -160,11 +182,16 @@ class RunConfig:
             type=str(optimizer_raw.get("type", "adamw")),
             lr=float(optimizer_raw.get("lr", 2e-4)),
             weight_decay=float(optimizer_raw.get("weight_decay", 0.01)),
+            stage_lrs={
+                str(k): float(v)
+                for k, v in (optimizer_raw.get("stage_lrs", {}) or {}).items()
+            },
         )
         training = TrainingConfig(
             global_batch_size=int(training_raw.get("global_batch_size", 256)),
             micro_batch_size=int(training_raw.get("micro_batch_size", 4)),
             grad_accum_steps=int(training_raw.get("grad_accum_steps", 1)),
+            grad_clip_norm=float(training_raw.get("grad_clip_norm", 1.0)),
             precision=str(training_raw.get("precision", "bf16")).lower(),
             device=str(training_raw.get("device", "auto")).lower(),
             max_steps=int(training_raw.get("max_steps", 50)),

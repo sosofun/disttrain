@@ -35,6 +35,12 @@ train.py
 python train.py --config configs/text_llm_only_local.yaml --max-steps 2
 ```
 
+支持 JSON 日志格式（便于接入监控）：
+
+```bash
+python train.py --config configs/text_llm_only_local.yaml --max-steps 2 --log-format json
+```
+
 或使用脚本（fake 数据）：
 
 ```bash
@@ -73,6 +79,22 @@ bash scripts/run_e2e_all_topologies.sh
 - `FORCE_CPU=1`：默认开启，强制 CPU（避免 Gloo + CUDA 混用）
 - `TIMEOUT_SEC=240`：单 case 超时时间（秒）
 - `LOG_DIR=/path/to/logs`：日志输出目录
+
+## 训练配置补充项
+
+- `training.grad_clip_norm`：梯度裁剪阈值（`0` 表示关闭）
+- `training.optimizer.stage_lrs`：按阶段覆盖学习率，例如：
+
+```yaml
+training:
+  optimizer:
+    type: adamw
+    lr: 2.0e-4
+    stage_lrs:
+      encoder: 1.5e-4
+      llm: 2.0e-4
+      decoder: 1.0e-4
+```
 
 ## 分布式启动示例
 

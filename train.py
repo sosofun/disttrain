@@ -5,6 +5,7 @@ from datetime import timedelta
 from pathlib import Path
 import random
 import os
+import json
 
 import torch
 import torch.distributed as dist
@@ -28,6 +29,12 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="",
         help="directory to save final checkpoint",
+    )
+    parser.add_argument(
+        "--log-format",
+        choices=("text", "json"),
+        default="text",
+        help="training log output format",
     )
     return parser.parse_args()
 
@@ -125,9 +132,13 @@ def main() -> int:
 
     stage_cfg = cfg.stages[topology.local_stage_name]
     model = build_stage_model(stage_cfg, cfg.training).to(device)
+    stage_lr = cfg.training.optimizer.stage_lrs.get(
+        topology.local_stage_name,
+        cfg.training.optimizer.lr,
+    )
     optimizer = torch.optim.AdamW(
         model.parameters(),
-        lr=cfg.training.optimizer.lr,
+        lr=stage_lr,
         weight_decay=cfg.training.optimizer.weight_decay,
     )
 
@@ -157,19 +168,47 @@ def main() -> int:
     metrics = engine.run(max_steps=max_steps - start_step)
     if is_log_rank(topology):
         for m in metrics:
-            print(
-                "[step={:04d}] loss={:.6f} step_time={:.3f}s fwd={:.3f}s bwd={:.3f}s "
-                "tokens/s={:.1f} bubble={:.4f} optimizer_step={}".format(
-                    start_step + m.step,
-                    m.loss,
-                    m.step_time_sec,
-                    m.forward_time_sec,
-                    m.backward_time_sec,
-                    m.tokens_per_sec,
-                    m.bubble_ratio,
-                    m.optimizer_stepped,
+            if args.log_format == "json":
+                payload = {
+                    "step": start_step + m.step,
+                    "rank": rank,
+                    "stage": topology.local_stage_name,
+                    "loss": m.loss,
+                    "step_time_sec": m.step_time_sec,
+                    "forward_time_sec": m.forward_time_sec,
+                    "backward_time_sec": m.backward_time_sec,
+                    "tokens_per_sec": m.tokens_per_sec,
+                    "samples_per_sec": m.samples_per_sec,
+                    "bubble_ratio": m.bubble_ratio,
+                    "comm_time_sec": m.comm_time_sec,
+                    "comm_bytes_mb": m.comm_bytes_mb,
+                    "comm_bandwidth_mb_s": m.comm_bandwidth_mb_s,
+                    "gpu_mem_peak_mb": m.gpu_mem_peak_mb,
+                    "grad_norm": m.grad_norm,
+                    "lr": m.lr,
+                    "optimizer_step": m.optimizer_stepped,
+                }
+                print(json.dumps(payload, ensure_ascii=False))
+            else:
+                print(
+                    "[step={:04d}] loss={:.6f} step_time={:.3f}s fwd={:.3f}s bwd={:.3f}s "
+                    "tokens/s={:.1f} samples/s={:.1f} comm={:.3f}s bw={:.2f}MB/s "
+                    "grad_norm={} lr={:.6g} bubble={:.4f} optimizer_step={}".format(
+                        start_step + m.step,
+                        m.loss,
+                        m.step_time_sec,
+                        m.forward_time_sec,
+                        m.backward_time_sec,
+                        m.tokens_per_sec,
+                        m.samples_per_sec,
+                        m.comm_time_sec,
+                        m.comm_bandwidth_mb_s,
+                        "n/a" if m.grad_norm is None else f"{m.grad_norm:.4f}",
+                        m.lr,
+                        m.bubble_ratio,
+                        m.optimizer_stepped,
+                    )
                 )
-            )
 
     if args.checkpoint_dir:
         ckpt_dir = Path(args.checkpoint_dir)

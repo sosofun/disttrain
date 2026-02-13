@@ -31,7 +31,14 @@ class StepMetrics:
     forward_time_sec: float
     backward_time_sec: float
     tokens_per_sec: float
+    samples_per_sec: float
     bubble_ratio: float
+    comm_time_sec: float
+    comm_bytes_mb: float
+    comm_bandwidth_mb_s: float
+    gpu_mem_peak_mb: float
+    grad_norm: Optional[float]
+    lr: float
     optimizer_stepped: bool
 
 
@@ -84,12 +91,18 @@ class TrainingEngine:
         self._forward_hidden: Dict[int, torch.Tensor] = {}
         self._forward_inputs: Dict[int, torch.Tensor] = {}
         self._losses: Dict[int, torch.Tensor] = {}
+        self._step_comm_time_sec = 0.0
+        self._step_comm_bytes = 0
 
     def _dist_ready(self) -> bool:
         return dist.is_available() and dist.is_initialized()
 
     def _transport_rank(self) -> bool:
         return self.local_tp_idx == 0
+
+    def _record_comm(self, elapsed_sec: float, tensor: torch.Tensor) -> None:
+        self._step_comm_time_sec += elapsed_sec
+        self._step_comm_bytes += tensor.numel() * tensor.element_size()
 
     def _tp_broadcast(self, tensor: torch.Tensor) -> torch.Tensor:
         if not self._dist_ready() or self.local_stage.tp_size == 1:
@@ -157,6 +170,7 @@ class TrainingEngine:
             src_rank = self.router.prev_peer_rank(self.local_stage_name, self.local_dp_idx)
             if src_rank is None:
                 raise RuntimeError("prev stage is missing for activation recv")
+            t0 = time.perf_counter()
             tensor, _ = recv_tensor(
                 shape=shape,
                 dtype=torch.float32,
@@ -165,6 +179,7 @@ class TrainingEngine:
                 tag=activation_tag(step, micro_batch_idx),
                 async_op=False,
             )
+            self._record_comm(time.perf_counter() - t0, tensor)
         else:
             tensor = torch.empty(shape, dtype=torch.float32, device=self.device)
         self._tp_broadcast(tensor)
@@ -178,12 +193,14 @@ class TrainingEngine:
         if dst_rank is None:
             raise RuntimeError("next stage is missing for activation send")
         use_async = self.config.pipeline.overlap_p2p_comm or self._force_async_p2p
+        t0 = time.perf_counter()
         work = send_tensor(
             tensor=hidden,
             dst_rank=dst_rank,
             tag=activation_tag(step, micro_batch_idx),
             async_op=use_async,
         )
+        self._record_comm(time.perf_counter() - t0, hidden)
         if work is not None:
             self.pending_works.append(work)
 
@@ -194,6 +211,7 @@ class TrainingEngine:
             src_rank = self.router.next_peer_rank(self.local_stage_name, self.local_dp_idx)
             if src_rank is None:
                 raise RuntimeError("next stage is missing for gradient recv")
+            t0 = time.perf_counter()
             grad, _ = recv_tensor(
                 shape=shape,
                 dtype=torch.float32,
@@ -202,6 +220,7 @@ class TrainingEngine:
                 tag=gradient_tag(step, micro_batch_idx),
                 async_op=False,
             )
+            self._record_comm(time.perf_counter() - t0, grad)
         else:
             grad = torch.empty(shape, dtype=torch.float32, device=self.device)
         self._tp_broadcast(grad)
@@ -221,12 +240,14 @@ class TrainingEngine:
         if dst_rank is None:
             raise RuntimeError("prev stage is missing for gradient send")
         use_async = self.config.pipeline.overlap_p2p_comm or self._force_async_p2p
+        t0 = time.perf_counter()
         work = send_tensor(
             tensor=grad,
             dst_rank=dst_rank,
             tag=gradient_tag(step, micro_batch_idx),
             async_op=use_async,
         )
+        self._record_comm(time.perf_counter() - t0, grad)
         if work is not None:
             self.pending_works.append(work)
 
@@ -324,14 +345,19 @@ class TrainingEngine:
             self._send_gradient(grad_in, step=step, micro_batch_idx=micro_batch_idx)
 
     def _wait_pending(self) -> None:
+        t0 = time.perf_counter()
         for work, _payload in self.pending_works:
             work.wait()
+        if self.pending_works:
+            self._step_comm_time_sec += time.perf_counter() - t0
         self.pending_works.clear()
 
     def _run_pipeline_step(self, step: int) -> Dict[str, float]:
         self._forward_hidden.clear()
         self._forward_inputs.clear()
         self._losses.clear()
+        self._step_comm_time_sec = 0.0
+        self._step_comm_bytes = 0
 
         scheduler = PipelineScheduler(
             schedule=self.config.pipeline.schedule,
@@ -355,10 +381,16 @@ class TrainingEngine:
                 backward_time += time.perf_counter() - t0
 
         self._wait_pending()
+        comm_mb = float(self._step_comm_bytes) / (1024.0 * 1024.0)
+        comm_time = float(self._step_comm_time_sec)
+        comm_bw = comm_mb / max(comm_time, 1e-6)
         return {
             "loss": total_loss / max(self.config.pipeline.num_micro_batches, 1),
             "forward_time": forward_time,
             "backward_time": backward_time,
+            "comm_time": comm_time,
+            "comm_mb": comm_mb,
+            "comm_bw": comm_bw,
         }
 
     def run(self, max_steps: int) -> List[StepMetrics]:
@@ -373,11 +405,21 @@ class TrainingEngine:
             if step % grad_accum_steps == 0:
                 self.optimizer.zero_grad(set_to_none=True)
 
+            if self.device.type == "cuda":
+                torch.cuda.reset_peak_memory_stats(self.device)
+
             t0 = time.perf_counter()
             out = self._run_pipeline_step(step)
             should_step = (step + 1) % grad_accum_steps == 0
+            grad_norm_value: Optional[float] = None
             if should_step:
                 self.group_manager.average_gradients(self.model)
+                if self.config.training.grad_clip_norm > 0:
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(),
+                        max_norm=self.config.training.grad_clip_norm,
+                    )
+                    grad_norm_value = float(grad_norm)
                 self.optimizer.step()
 
             step_time = time.perf_counter() - t0
@@ -386,7 +428,17 @@ class TrainingEngine:
                 * self.config.training.seq_len
                 * self.config.pipeline.num_micro_batches
             )
+            samples = (
+                self.config.training.micro_batch_size
+                * self.config.pipeline.num_micro_batches
+            )
             tokens_per_sec = float(tokens) / max(step_time, 1e-6)
+            samples_per_sec = float(samples) / max(step_time, 1e-6)
+            gpu_mem_peak_mb = 0.0
+            if self.device.type == "cuda":
+                gpu_mem_peak_mb = float(torch.cuda.max_memory_allocated(self.device)) / (
+                    1024.0 * 1024.0
+                )
             metrics.append(
                 StepMetrics(
                     step=step,
@@ -395,7 +447,14 @@ class TrainingEngine:
                     forward_time_sec=float(out["forward_time"]),
                     backward_time_sec=float(out["backward_time"]),
                     tokens_per_sec=tokens_per_sec,
+                    samples_per_sec=samples_per_sec,
                     bubble_ratio=self.bubble_ratio,
+                    comm_time_sec=float(out["comm_time"]),
+                    comm_bytes_mb=float(out["comm_mb"]),
+                    comm_bandwidth_mb_s=float(out["comm_bw"]),
+                    gpu_mem_peak_mb=gpu_mem_peak_mb,
+                    grad_norm=grad_norm_value,
+                    lr=float(self.optimizer.param_groups[0].get("lr", 0.0)),
                     optimizer_stepped=should_step,
                 )
             )
