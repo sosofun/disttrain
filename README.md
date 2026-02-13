@@ -80,6 +80,12 @@ bash scripts/run_e2e_3stage_smoke.sh
 bash scripts/run_e2e_all_topologies.sh
 ```
 
+DDP DP 同步专项回归（2 进程 LLM-only，校验 `sync_impl=ddp`）：
+
+```bash
+bash scripts/run_e2e_ddp_dp_sync.sh
+```
+
 可选环境变量：
 
 - `STEPS=5`：每个 case 的训练步数
