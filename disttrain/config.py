@@ -59,6 +59,7 @@ class TrainingConfig:
     micro_batch_size: int = 4
     grad_accum_steps: int = 1
     precision: str = "bf16"
+    device: str = "auto"
     max_steps: int = 50
     seq_len: int = 128
     vocab_size: int = 32000
@@ -127,6 +128,11 @@ class RunConfig:
             raise ConfigError("training.hidden_size must be >= 1")
         if self.training.seq_len < 1:
             raise ConfigError("training.seq_len must be >= 1")
+        if self.training.device not in {"auto", "cpu", "cuda"}:
+            raise ConfigError(
+                "training.device must be one of {'auto','cpu','cuda'}, "
+                f"got {self.training.device}"
+            )
 
         if self.training.optimizer.type.lower() != "adamw":
             raise ConfigError("training.optimizer.type currently only supports 'adamw'")
@@ -160,6 +166,7 @@ class RunConfig:
             micro_batch_size=int(training_raw.get("micro_batch_size", 4)),
             grad_accum_steps=int(training_raw.get("grad_accum_steps", 1)),
             precision=str(training_raw.get("precision", "bf16")).lower(),
+            device=str(training_raw.get("device", "auto")).lower(),
             max_steps=int(training_raw.get("max_steps", 50)),
             seq_len=int(training_raw.get("seq_len", 128)),
             vocab_size=int(training_raw.get("vocab_size", 32000)),

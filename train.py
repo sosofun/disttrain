@@ -63,11 +63,28 @@ def init_distributed(config: RunConfig) -> tuple[int, int, int, torch.device]:
         world_size = dist.get_world_size()
         rank = dist.get_rank()
 
-    if torch.cuda.is_available():
-        device = torch.device(f"cuda:{local_rank}")
-        torch.cuda.set_device(device)
-    else:
+    requested_device = config.training.device
+    backend = config.distributed.backend
+
+    if requested_device == "cpu":
         device = torch.device("cpu")
+    elif requested_device == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("training.device is 'cuda' but CUDA is unavailable")
+        if backend == "gloo":
+            print("[WARN] backend=gloo with training.device=cuda is unsupported for p2p, fallback to CPU.")
+            device = torch.device("cpu")
+        else:
+            device = torch.device(f"cuda:{local_rank}")
+            torch.cuda.set_device(device)
+    else:  # auto
+        if torch.cuda.is_available() and backend != "gloo":
+            device = torch.device(f"cuda:{local_rank}")
+            torch.cuda.set_device(device)
+        else:
+            if torch.cuda.is_available() and backend == "gloo" and rank == 0:
+                print("[WARN] backend=gloo detected, force CPU device for safe tensor transport.")
+            device = torch.device("cpu")
 
     return world_size, rank, local_rank, device
 

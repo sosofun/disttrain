@@ -25,6 +25,7 @@ training:
   micro_batch_size: 2
   grad_accum_steps: 1
   precision: fp32
+  device: cpu
   max_steps: 5
   seq_len: 32
   vocab_size: 2048
