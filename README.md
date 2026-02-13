@@ -169,6 +169,8 @@ ZeRO-1 Distributed Optimizer（本实现）关键步骤：
 4. 将本地更新后的 fp32 参数 shard cast 回模型参数 dtype（bf16/fp16/fp32）并写入参数 buffer。
 5. 在 DP 组执行 `all_gather`，恢复完整参数 buffer；模型参数视图直接指向该 buffer，可立即进入下一轮前向。
 
+实现细节：参数 buffer 按 dtype 分桶管理（bf16/fp16/fp32 各自独立 contiguous buffer），避免混合 dtype 参数写入同一 buffer。
+
 注意：当 `zero_stage=1` 时，DP 通信由优化器内部处理，训练会自动跳过 DDP 的 DP all-reduce 路径。
 
 ## 分布式启动示例
