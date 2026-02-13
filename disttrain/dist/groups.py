@@ -158,6 +158,8 @@ class ProcessGroupManager:
                     divisor=float(stage.tp_size),
                     bucket_mb=bucket_mb,
                 )
+                if tp_stats is None:
+                    tp_stats = {"time_sec": 0.0, "bytes_mb": 0.0}
             stats["time_sec"] += tp_stats["time_sec"]
             stats["bytes_mb"] += tp_stats["bytes_mb"]
 
@@ -168,6 +170,8 @@ class ProcessGroupManager:
                 divisor=float(stage.dp_size),
                 bucket_mb=bucket_mb,
             )
+            if dp_stats is None:
+                dp_stats = {"time_sec": 0.0, "bytes_mb": 0.0}
             stats["time_sec"] += dp_stats["time_sec"]
             stats["bytes_mb"] += dp_stats["bytes_mb"]
         return stats
@@ -237,6 +241,7 @@ class ProcessGroupManager:
                 n = grad.numel()
                 grad.copy_(flat[offset : offset + n].view_as(grad))
                 offset += n
+        return stats
 
     def clear(self) -> None:
         self.stage_groups.clear()
