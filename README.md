@@ -142,6 +142,12 @@ Checkpoint 恢复时默认会恢复 RNG 状态（保证可复现），如需关�
 python train.py --config configs/text_llm_only_local.yaml --resume ckpt.pt --no-restore-rng
 ```
 
+默认保存/恢复的 RNG 状态包括：
+- Python `random`
+- NumPy `np.random`（若环境安装了 numpy）
+- PyTorch CPU RNG
+- PyTorch CUDA RNG（`torch.cuda.get_rng_state_all`）
+
 - `distributed.grad_sync_bucket_mb`：梯度 all-reduce bucket 大小（MB，`0` 表示按参数逐个同步）
 - `training.optimizer.zero_stage`：优化器分片等级，当前支持：
   - `0`：常规 AdamW（默认）

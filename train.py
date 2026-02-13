@@ -65,6 +65,13 @@ def dist_ready() -> bool:
 def setup_seed(seed: int, rank: int) -> None:
     final_seed = seed + rank
     random.seed(final_seed)
+    try:
+        import numpy as np  # type: ignore
+
+        np.random.seed(final_seed % (2**32))
+    except Exception:
+        # NumPy is optional for this repo; skip when unavailable.
+        pass
     torch.manual_seed(final_seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(final_seed)

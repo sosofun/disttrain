@@ -9,6 +9,11 @@ import torch
 from disttrain.config import RunConfig
 from disttrain.dist.topology import Topology
 
+try:
+    import numpy as np  # type: ignore
+except Exception:
+    np = None  # type: ignore[assignment]
+
 
 def checkpoint_metadata(config: RunConfig, topology: Topology) -> Dict[str, Any]:
     return {
@@ -146,6 +151,8 @@ def _capture_rng_state() -> Dict[str, Any]:
         "python_random_state": random.getstate(),
         "torch_rng_state": torch.random.get_rng_state(),
     }
+    if np is not None:
+        state["numpy_random_state"] = np.random.get_state()
     if torch.cuda.is_available():
         state["torch_cuda_rng_state_all"] = torch.cuda.get_rng_state_all()
     return state
@@ -160,6 +167,9 @@ def _restore_rng_state(rng_state: Optional[Dict[str, Any]]) -> None:
     torch_state = rng_state.get("torch_rng_state")
     if torch_state is not None:
         torch.random.set_rng_state(torch_state)
+    numpy_state = rng_state.get("numpy_random_state")
+    if numpy_state is not None and np is not None:
+        np.random.set_state(numpy_state)
     cuda_state_all = rng_state.get("torch_cuda_rng_state_all")
     if cuda_state_all is not None and torch.cuda.is_available():
         torch.cuda.set_rng_state_all(cuda_state_all)
