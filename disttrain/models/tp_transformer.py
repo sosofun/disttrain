@@ -4,9 +4,14 @@ import math
 from typing import Optional
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
+from disttrain.models.sequence_parallel import (
+    sequence_all_gather,
+    sequence_reduce_scatter,
+)
 from disttrain.models.tp_layers import ColumnParallelLinear, RowParallelLinear
 
 
@@ -127,8 +132,13 @@ class TPTransformerBlock(nn.Module):
         tp_size: int,
         tp_rank: int,
         causal: bool = False,
+        sequence_parallel: bool = False,
     ):
         super().__init__()
+        self.tp_size = tp_size
+        self.tp_rank = tp_rank
+        self.sequence_parallel = sequence_parallel and tp_size > 1
+        self.tp_group: Optional[dist.ProcessGroup] = None
         self.norm1 = nn.LayerNorm(hidden_size)
         self.attn = TPSelfAttention(
             hidden_size=hidden_size,
@@ -145,10 +155,29 @@ class TPTransformerBlock(nn.Module):
         )
 
     def set_tp_group(self, tp_group: Optional[object]) -> None:
+        self.tp_group = tp_group  # type: ignore[assignment]
         self.attn.set_tp_group(tp_group)
         self.ffn.set_tp_group(tp_group)
 
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
-        hidden = hidden + self.attn(self.norm1(hidden))
-        hidden = hidden + self.ffn(self.norm2(hidden))
-        return hidden
+        if not self.sequence_parallel:
+            hidden = hidden + self.attn(self.norm1(hidden))
+            hidden = hidden + self.ffn(self.norm2(hidden))
+            return hidden
+
+        # Sequence parallel:
+        # LN/dropout-like ops run on local sequence shard; TP core runs on full
+        # sequence between all-gather/reduce-scatter conjugate ops.
+        local = hidden
+        x = self.norm1(local)
+        x = sequence_all_gather(x, self.tp_group, self.tp_size)
+        x = self.attn(x)
+        x = sequence_reduce_scatter(x, self.tp_group, self.tp_size)
+        local = local + x
+
+        y = self.norm2(local)
+        y = sequence_all_gather(y, self.tp_group, self.tp_size)
+        y = self.ffn(y)
+        y = sequence_reduce_scatter(y, self.tp_group, self.tp_size)
+        local = local + y
+        return local

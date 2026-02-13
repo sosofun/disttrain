@@ -115,6 +115,31 @@ class ConfigTopologyTests(unittest.TestCase):
         self.assertTrue(cfg.stages["llm"].activation_checkpoint)
         self.assertTrue(cfg.training.io.enable_prefetch)
 
+    def test_sequence_parallel_requires_tp(self) -> None:
+        raw = {
+            "distributed": {"world_size": 1, "backend": "gloo"},
+            "stages": {
+                "encoder": {"enabled": False},
+                "llm": {
+                    "enabled": True,
+                    "tp_size": 1,
+                    "dp_size": 1,
+                    "model_cls": "LLMModel",
+                    "sequence_parallel": True,
+                },
+                "decoder": {"enabled": False},
+            },
+            "pipeline": {"schedule": "gpipe", "num_micro_batches": 1},
+            "training": {
+                "micro_batch_size": 2,
+                "hidden_size": 64,
+                "seq_len": 16,
+                "num_attention_heads": 8,
+            },
+        }
+        with self.assertRaises(ConfigError):
+            RunConfig.from_dict(raw)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -3,12 +3,17 @@ from __future__ import annotations
 from typing import Dict, Optional
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.utils.checkpoint as checkpoint
 
 from disttrain.config import StageConfig, TrainingConfig
 from disttrain.models.base import StageModel, TensorDict
 from disttrain.models.modalities import build_decoder_modality
+from disttrain.models.sequence_parallel import (
+    sequence_all_gather,
+    split_sequence_local,
+)
 from disttrain.models.tp_layers import ColumnParallelLinear
 from disttrain.models.tp_transformer import TPTransformerBlock
 
@@ -26,8 +31,10 @@ class DecoderModel(StageModel):
         super().__init__()
         self.output_modalities = list(stage_cfg.output_modalities)
         self.use_activation_checkpoint = stage_cfg.activation_checkpoint
+        self.use_sequence_parallel = stage_cfg.sequence_parallel and tp_size > 1
         self.tp_size = tp_size
         self.tp_rank = tp_rank
+        self.tp_group: Optional[dist.ProcessGroup] = None
         self.text_head = ColumnParallelLinear(
             train_cfg.hidden_size,
             train_cfg.vocab_size,
@@ -43,6 +50,7 @@ class DecoderModel(StageModel):
                     tp_size=tp_size,
                     tp_rank=tp_rank,
                     causal=False,
+                    sequence_parallel=self.use_sequence_parallel,
                 )
             ]
         )
@@ -73,11 +81,15 @@ class DecoderModel(StageModel):
         if "hidden_states" not in inputs:
             raise KeyError("DecoderModel expects 'hidden_states'")
         hidden = inputs["hidden_states"]
+        if self.use_sequence_parallel:
+            hidden = split_sequence_local(hidden, self.tp_size, self.tp_rank)
         for block in self.blocks:
             if self.use_activation_checkpoint and self.training:
                 hidden = checkpoint.checkpoint(block, hidden, use_reentrant=False)
             else:
                 hidden = block(hidden)
+        if self.use_sequence_parallel:
+            hidden = sequence_all_gather(hidden, self.tp_group, self.tp_size)
         hidden = self.norm(hidden)
         pooled = hidden.mean(dim=1)
 
@@ -104,6 +116,7 @@ class DecoderModel(StageModel):
         return out
 
     def set_tp_group(self, tp_group: Optional[object]) -> None:
+        self.tp_group = tp_group  # type: ignore[assignment]
         self.text_head.set_tp_group(tp_group)  # type: ignore[arg-type]
         for block in self.blocks:
             block.set_tp_group(tp_group)

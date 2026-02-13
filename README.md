@@ -123,6 +123,7 @@ python train.py --config configs/text_llm_only_local.yaml --resume ckpt.pt --no-
 
 - `distributed.grad_sync_bucket_mb`：梯度 all-reduce bucket 大小（MB，`0` 表示按参数逐个同步）
 - `stages.<stage>.activation_checkpoint`：按阶段启用 activation checkpoint（true/false）
+- `stages.<stage>.sequence_parallel`：在 TP 基础上启用序列并行（要求 `tp_size > 1`）
 - `training.io`：I/O 占位优化开关（prefetch/pin_memory）：
 
 ```yaml

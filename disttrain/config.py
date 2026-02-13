@@ -31,6 +31,7 @@ class StageConfig:
     dp_size: int = 1
     model_cls: str = ""
     activation_checkpoint: bool = False
+    sequence_parallel: bool = False
     input_modalities: List[str] = field(default_factory=list)
     output_modalities: List[str] = field(default_factory=list)
 
@@ -114,6 +115,11 @@ class RunConfig:
                 raise ConfigError(f"stages.{stage_name}.model_cls cannot be empty")
             _validate_modalities(stage_name, stage.input_modalities, "input_modalities")
             _validate_modalities(stage_name, stage.output_modalities, "output_modalities")
+            if stage.sequence_parallel and stage.tp_size <= 1:
+                raise ConfigError(
+                    f"stages.{stage_name}.sequence_parallel requires tp_size > 1, "
+                    f"got tp_size={stage.tp_size}"
+                )
 
         if not self.stages["llm"].enabled:
             raise ConfigError("stages.llm.enabled must be true")
@@ -274,6 +280,7 @@ class RunConfig:
                     )
                 ),
                 activation_checkpoint=bool(stage_raw.get("activation_checkpoint", False)),
+                sequence_parallel=bool(stage_raw.get("sequence_parallel", False)),
                 input_modalities=[str(x) for x in stage_raw.get("input_modalities", [])],
                 output_modalities=[str(x) for x in stage_raw.get("output_modalities", [])],
             )

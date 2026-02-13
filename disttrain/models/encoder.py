@@ -3,12 +3,17 @@ from __future__ import annotations
 from typing import Dict, Optional
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.utils.checkpoint as checkpoint
 
 from disttrain.config import StageConfig, TrainingConfig
 from disttrain.models.base import StageModel, TensorDict
 from disttrain.models.modalities import build_encoder_modality
+from disttrain.models.sequence_parallel import (
+    sequence_all_gather,
+    split_sequence_local,
+)
 from disttrain.models.tp_layers import VocabParallelEmbedding
 from disttrain.models.tp_transformer import TPTransformerBlock
 
@@ -27,8 +32,10 @@ class EncoderModel(StageModel):
         self.hidden_size = train_cfg.hidden_size
         self.input_modalities = list(stage_cfg.input_modalities)
         self.use_activation_checkpoint = stage_cfg.activation_checkpoint
+        self.use_sequence_parallel = stage_cfg.sequence_parallel and tp_size > 1
         self.tp_size = tp_size
         self.tp_rank = tp_rank
+        self.tp_group: Optional[dist.ProcessGroup] = None
         self.text_embedding = VocabParallelEmbedding(
             train_cfg.vocab_size,
             train_cfg.hidden_size,
@@ -43,6 +50,7 @@ class EncoderModel(StageModel):
                     tp_size=tp_size,
                     tp_rank=tp_rank,
                     causal=False,
+                    sequence_parallel=self.use_sequence_parallel,
                 )
             ]
         )
@@ -77,6 +85,7 @@ class EncoderModel(StageModel):
         self.branches = nn.ModuleDict(branches)
 
     def set_tp_group(self, tp_group: Optional[object]) -> None:
+        self.tp_group = tp_group  # type: ignore[assignment]
         self.text_embedding.set_tp_group(tp_group)  # type: ignore[arg-type]
         for block in self.blocks:
             block.set_tp_group(tp_group)
@@ -102,10 +111,14 @@ class EncoderModel(StageModel):
             fused_bias = fused_bias + branch(inputs[name])
 
         hidden = hidden + fused_bias.unsqueeze(1)
+        if self.use_sequence_parallel:
+            hidden = split_sequence_local(hidden, self.tp_size, self.tp_rank)
         for block in self.blocks:
             if self.use_activation_checkpoint and self.training:
                 hidden = checkpoint.checkpoint(block, hidden, use_reentrant=False)
             else:
                 hidden = block(hidden)
+        if self.use_sequence_parallel:
+            hidden = sequence_all_gather(hidden, self.tp_group, self.tp_size)
         hidden = self.norm(hidden)
         return {"hidden_states": hidden}

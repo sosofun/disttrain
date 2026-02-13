@@ -18,6 +18,7 @@ stages:
     dp_size: 1
     model_cls: LLMModel
     activation_checkpoint: true
+    sequence_parallel: true
   decoder:
     enabled: true
     tp_size: 1
