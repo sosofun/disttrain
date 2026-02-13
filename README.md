@@ -35,6 +35,18 @@ train.py
 python train.py --config configs/text_llm_only_local.yaml --max-steps 2
 ```
 
+或使用脚本（fake 数据）：
+
+```bash
+bash scripts/run_fake_data.sh local-llm
+```
+
+三阶段 CPU 多进程 fake 数据：
+
+```bash
+bash scripts/run_fake_data.sh tri-stage-cpu
+```
+
 ## 分布式启动示例
 
 纯文本 LLM（8 卡）：
