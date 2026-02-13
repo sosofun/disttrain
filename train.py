@@ -69,8 +69,13 @@ def init_distributed(config: RunConfig) -> tuple[int, int, int, torch.device]:
     rank = int(os.environ.get("RANK", "0"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
 
+    backend = config.distributed.backend
+    # Bind CUDA device before NCCL PG init to avoid "device currently unknown" warnings
+    # and potential hangs caused by ambiguous rank->device mapping.
+    if world_size > 1 and backend == "nccl" and torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+
     if world_size > 1 and not dist_ready():
-        backend = config.distributed.backend
         if backend == "nccl" and not torch.cuda.is_available():
             print("[WARN] NCCL requested but CUDA unavailable, fallback to gloo.")
             backend = "gloo"
