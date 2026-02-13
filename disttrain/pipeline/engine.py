@@ -475,6 +475,7 @@ class TrainingEngine:
             opt_sync_stats = {"time_sec": 0.0, "bytes_mb": 0.0}
             sync_impl = "none"
             if should_step:
+                zero_stage = int(getattr(self.optimizer, "zero_stage", 0))
                 if self.scaler is not None:
                     self.scaler.unscale_(self.optimizer)
                 if self.use_ddp:
@@ -493,13 +494,27 @@ class TrainingEngine:
                     if self.local_stage.tp_size > 1:
                         sync_impl = "ddp+tp_manual"
                 else:
-                    sync_impl = "manual"
-                    sync_stats = self.group_manager.average_gradients(
-                        self.model,
-                        bucket_mb=self.config.distributed.grad_sync_bucket_mb,
-                        sync_tp=True,
-                        sync_dp=True,
-                    )
+                    if zero_stage == 1:
+                        # Distributed optimizer handles DP sync via reduce-scatter/all-gather.
+                        sync_impl = "zero1"
+                        if self.local_stage.tp_size > 1:
+                            tp_stats = self.group_manager.average_gradients(
+                                self.model,
+                                bucket_mb=self.config.distributed.grad_sync_bucket_mb,
+                                sync_tp=True,
+                                sync_dp=False,
+                            )
+                            sync_stats["time_sec"] += tp_stats["time_sec"]
+                            sync_stats["bytes_mb"] += tp_stats["bytes_mb"]
+                            sync_impl = "tp_manual+zero1"
+                    else:
+                        sync_impl = "manual"
+                        sync_stats = self.group_manager.average_gradients(
+                            self.model,
+                            bucket_mb=self.config.distributed.grad_sync_bucket_mb,
+                            sync_tp=True,
+                            sync_dp=True,
+                        )
                 if self.config.training.grad_clip_norm > 0:
                     grad_norm = torch.nn.utils.clip_grad_norm_(
                         self.model.parameters(),
@@ -512,7 +527,7 @@ class TrainingEngine:
                     scaler_scale = float(self.scaler.get_scale())
                 else:
                     self.optimizer.step()
-                if int(getattr(self.optimizer, "zero_stage", 0)) == 1:
+                if zero_stage == 1:
                     if sync_impl == "none":
                         sync_impl = "zero1"
                     elif "zero1" not in sync_impl:

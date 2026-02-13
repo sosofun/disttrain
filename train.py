@@ -382,7 +382,7 @@ def _build_optimizer(
             )
             if topology.runtime_rank == 0:
                 print(
-                    "[INFO] enabled ZeRO-1 optimizer for stage={}, dp={}, tp={}".format(
+                    "[INFO] enabled ZeRO-1 distributed optimizer for stage={}, dp={}, tp={}".format(
                         topology.local_stage_name,
                         topology.local_stage.dp_size,
                         topology.local_stage.tp_size,
@@ -419,6 +419,15 @@ def _wrap_model_with_ddp_if_needed(
     device: torch.device,
 ) -> torch.nn.Module:
     if not dist_ready():
+        return model
+    if cfg.training.optimizer.zero_stage == 1:
+        # ZeRO-1 distributed optimizer performs DP communication via
+        # reduce-scatter/all-gather in optimizer.step(); skip DDP all-reduce hooks.
+        if topology.runtime_rank == 0 and topology.local_stage.dp_size > 1:
+            print(
+                f"[INFO] skip DDP for stage={topology.local_stage_name} "
+                "because zero_stage=1 uses distributed optimizer communication."
+            )
         return model
     if topology.local_stage.dp_size <= 1:
         return model

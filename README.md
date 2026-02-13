@@ -136,7 +136,7 @@ python train.py --config configs/text_llm_only_local.yaml --resume ckpt.pt --no-
 - `distributed.grad_sync_bucket_mb`：梯度 all-reduce bucket 大小（MB，`0` 表示按参数逐个同步）
 - `training.optimizer.zero_stage`：优化器分片等级，当前支持：
   - `0`：常规 AdamW（默认）
-  - `1`：ZeRO-1（仅分片 optimizer state，参数与梯度仍为副本）
+  - `1`：ZeRO-1 Distributed Optimizer（连续参数/主梯度 buffer + `reduce_scatter/all_gather`）
 - `stages.<stage>.activation_checkpoint`：按阶段启用 activation checkpoint（true/false）
 - `stages.<stage>.sequence_parallel`：在 TP 基础上启用序列并行（要求 `tp_size > 1`）
 - `training.io`：I/O 占位优化开关（prefetch/pin_memory）：
@@ -160,6 +160,16 @@ training:
     lr: 1.0e-3
     weight_decay: 0.01
 ```
+
+ZeRO-1 Distributed Optimizer（本实现）关键步骤：
+
+1. backward 完成后，将模型梯度拷贝到 **fp32 main gradient contiguous buffer**。
+2. 在 DP 组上执行 `reduce_scatter`，每个 rank 仅保留本地 shard 的已规约梯度。
+3. 在本地 shard 上用 **fp32 main parameter shard** 执行 AdamW 更新。
+4. 将本地更新后的 fp32 参数 shard cast 回模型参数 dtype（bf16/fp16/fp32）并写入参数 buffer。
+5. 在 DP 组执行 `all_gather`，恢复完整参数 buffer；模型参数视图直接指向该 buffer，可立即进入下一轮前向。
+
+注意：当 `zero_stage=1` 时，DP 通信由优化器内部处理，训练会自动跳过 DDP 的 DP all-reduce 路径。
 
 ## 分布式启动示例
 
