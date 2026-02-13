@@ -17,6 +17,7 @@ from disttrain.config import ConfigError, RunConfig, load_config
 from disttrain.dist.groups import ProcessGroupManager
 from disttrain.dist.topology import Topology, TopologyError
 from disttrain.models.registry import build_stage_model
+from disttrain.optim import Zero1AdamW
 from disttrain.pipeline.engine import TrainingEngine
 
 
@@ -191,10 +192,12 @@ def main() -> int:
         device=device,
     )
 
-    optimizer = torch.optim.AdamW(
-        base_model.parameters(),
+    optimizer = _build_optimizer(
+        cfg=cfg,
+        topology=topology,
+        group_manager=group_manager,
+        params=base_model.parameters(),
         lr=stage_lr,
-        weight_decay=cfg.training.optimizer.weight_decay,
     )
     scaler = _build_scaler_if_needed(cfg, topology, device)
 
@@ -357,6 +360,49 @@ def _build_scaler_if_needed(
     except Exception:
         # Backward compatibility path for older torch APIs.
         return torch.cuda.amp.GradScaler()
+
+
+def _build_optimizer(
+    cfg: RunConfig,
+    topology: Topology,
+    group_manager: ProcessGroupManager,
+    params,
+    lr: float,
+) -> torch.optim.Optimizer:
+    zero_stage = cfg.training.optimizer.zero_stage
+    if zero_stage == 1 and topology.local_stage.dp_size > 1 and dist_ready():
+        dp_group = group_manager.local_dp_group
+        if dp_group is not None:
+            optimizer = Zero1AdamW(
+                params=params,
+                lr=lr,
+                weight_decay=cfg.training.optimizer.weight_decay,
+                dp_group=dp_group,
+                dp_global_ranks=_dp_group_global_ranks(topology),
+            )
+            if topology.runtime_rank == 0:
+                print(
+                    "[INFO] enabled ZeRO-1 optimizer for stage={}, dp={}, tp={}".format(
+                        topology.local_stage_name,
+                        topology.local_stage.dp_size,
+                        topology.local_stage.tp_size,
+                    )
+                )
+            return optimizer
+    return torch.optim.AdamW(
+        params,
+        lr=lr,
+        weight_decay=cfg.training.optimizer.weight_decay,
+    )
+
+
+def _dp_group_global_ranks(topology: Topology) -> list[int]:
+    stage_name = topology.local_stage_name
+    tp_idx = topology.local_tp_index()
+    stage = topology.local_stage
+    return [
+        topology.rank_for(stage_name, dp_idx, tp_idx) for dp_idx in range(stage.dp_size)
+    ]
 
 
 def _wrap_model_with_ddp_if_needed(

@@ -166,6 +166,7 @@
 **任务**
 - 异步 `isend/irecv` 与计算重叠；
 - 梯度通信 bucket 化；
+- 引入 ZeRO-1 分布式优化器（optimizer state 分片）并建立回归用例；
 - activation checkpoint 策略分阶段调优；
 - 视频/语音数据加载缓存与分片优化；
 - 建立性能基线并回归测试。

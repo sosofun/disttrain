@@ -55,6 +55,7 @@ class OptimizerConfig:
     lr: float = 2e-4
     weight_decay: float = 0.01
     stage_lrs: Dict[str, float] = field(default_factory=dict)
+    zero_stage: int = 0
 
 
 @dataclass
@@ -182,6 +183,11 @@ class RunConfig:
 
         if self.training.optimizer.type.lower() != "adamw":
             raise ConfigError("training.optimizer.type currently only supports 'adamw'")
+        if self.training.optimizer.zero_stage not in {0, 1}:
+            raise ConfigError(
+                "training.optimizer.zero_stage must be 0 or 1, "
+                f"got {self.training.optimizer.zero_stage}"
+            )
         for stage_name in STAGE_ORDER:
             stage = self.stages[stage_name]
             if not stage.enabled:
@@ -234,6 +240,7 @@ class RunConfig:
                 str(k): float(v)
                 for k, v in (optimizer_raw.get("stage_lrs", {}) or {}).items()
             },
+            zero_stage=int(optimizer_raw.get("zero_stage", 0)),
         )
         io_cfg = IOConfig(
             enable_prefetch=bool(io_raw.get("enable_prefetch", True)),

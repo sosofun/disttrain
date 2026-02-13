@@ -472,6 +472,7 @@ class TrainingEngine:
                 float(self.scaler.get_scale()) if self.scaler is not None else None
             )
             sync_stats = {"time_sec": 0.0, "bytes_mb": 0.0}
+            opt_sync_stats = {"time_sec": 0.0, "bytes_mb": 0.0}
             sync_impl = "none"
             if should_step:
                 if self.scaler is not None:
@@ -511,10 +512,27 @@ class TrainingEngine:
                     scaler_scale = float(self.scaler.get_scale())
                 else:
                     self.optimizer.step()
+                if int(getattr(self.optimizer, "zero_stage", 0)) == 1:
+                    if sync_impl == "none":
+                        sync_impl = "zero1"
+                    elif "zero1" not in sync_impl:
+                        sync_impl = f"{sync_impl}+zero1"
+                    zero_stats = getattr(self.optimizer, "last_sync_stats", None)
+                    if isinstance(zero_stats, dict):
+                        opt_sync_stats["time_sec"] = float(zero_stats.get("time_sec", 0.0))
+                        opt_sync_stats["bytes_mb"] = float(zero_stats.get("bytes_mb", 0.0))
 
             step_time = time.perf_counter() - t0
-            total_comm_time = float(out["comm_time"]) + float(sync_stats["time_sec"])
-            total_comm_mb = float(out["comm_mb"]) + float(sync_stats["bytes_mb"])
+            total_comm_time = (
+                float(out["comm_time"])
+                + float(sync_stats["time_sec"])
+                + float(opt_sync_stats["time_sec"])
+            )
+            total_comm_mb = (
+                float(out["comm_mb"])
+                + float(sync_stats["bytes_mb"])
+                + float(opt_sync_stats["bytes_mb"])
+            )
             total_comm_bw = total_comm_mb / max(total_comm_time, 1e-6)
             tokens = (
                 self.config.training.micro_batch_size

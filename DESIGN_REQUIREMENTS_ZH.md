@@ -206,6 +206,7 @@
 
 ### FR-09 优化器与精度
 - 支持 AdamW。
+- 支持 ZeRO-1（Optimizer State 分片）以降低 DP 场景显存占用。
 - 支持 BF16 或 FP16 混合精度。
 - 支持梯度裁剪、梯度累积。
 - 支持按阶段独立学习率组（可选）。
@@ -268,6 +269,7 @@
 ## 7.3 显存效率
 - 支持 activation checkpoint。
 - 支持按阶段独立的重计算策略（LLM 阶段可更激进，Encoder/Decoder 可更保守）。
+- 支持 ZeRO-1 优化器状态分片（至少在 `dp_size > 1` 场景可用）。
 
 ## 7.4 扩展性
 - 允许三阶段分别增减 `tp_size` 与 `dp_size`，不需要改动核心调度代码。
@@ -433,6 +435,7 @@ training:
   precision: bf16
   optimizer:
     type: adamw
+    zero_stage: 1
     lr: 3e-4
     weight_decay: 0.01
 ```
