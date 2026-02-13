@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import math
-from typing import Dict, Optional, Tuple
+import time
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -115,26 +116,115 @@ class ProcessGroupManager:
         if stage.tp_size == 1 and stage.dp_size == 1:
             return
 
-    def average_gradients(self, model: torch.nn.Module) -> None:
+    def average_gradients(
+        self,
+        model: torch.nn.Module,
+        bucket_mb: float = 25.0,
+    ) -> Dict[str, float]:
+        stats = {
+            "time_sec": 0.0,
+            "bytes_mb": 0.0,
+        }
         if not self.is_initialized:
-            return
+            return stats
 
         local_stage = self.topology.local_stage_name
         stage = self.topology.stages[local_stage]
         tp_group = self.local_tp_group
         dp_group = self.local_dp_group
         if tp_group is None or dp_group is None:
-            return
+            return stats
 
-        for p in model.parameters():
-            if p.grad is None:
+        grads = [p.grad for p in model.parameters() if p.grad is not None]
+        if not grads:
+            return stats
+
+        if stage.tp_size > 1:
+            tp_stats = self._all_reduce_bucketed(
+                grads,
+                group=tp_group,
+                divisor=float(stage.tp_size),
+                bucket_mb=bucket_mb,
+            )
+            stats["time_sec"] += tp_stats["time_sec"]
+            stats["bytes_mb"] += tp_stats["bytes_mb"]
+
+        if stage.dp_size > 1:
+            dp_stats = self._all_reduce_bucketed(
+                grads,
+                group=dp_group,
+                divisor=float(stage.dp_size),
+                bucket_mb=bucket_mb,
+            )
+            stats["time_sec"] += dp_stats["time_sec"]
+            stats["bytes_mb"] += dp_stats["bytes_mb"]
+        return stats
+
+    def _all_reduce_bucketed(
+        self,
+        grads: List[torch.Tensor],
+        group: dist.ProcessGroup,
+        divisor: float,
+        bucket_mb: float,
+    ) -> Dict[str, float]:
+        stats = {"time_sec": 0.0, "bytes_mb": 0.0}
+        bucket_bytes = int(bucket_mb * 1024 * 1024) if bucket_mb > 0 else 0
+        buckets: List[List[torch.Tensor]] = []
+
+        current: List[torch.Tensor] = []
+        current_bytes = 0
+        current_dtype = None
+        current_device = None
+        for grad in grads:
+            grad_bytes = grad.numel() * grad.element_size()
+            need_flush = False
+            if current:
+                if grad.dtype != current_dtype or grad.device != current_device:
+                    need_flush = True
+                elif bucket_bytes > 0 and current_bytes + grad_bytes > bucket_bytes:
+                    need_flush = True
+            if need_flush:
+                buckets.append(current)
+                current = []
+                current_bytes = 0
+                current_dtype = None
+                current_device = None
+
+            if not current:
+                current_dtype = grad.dtype
+                current_device = grad.device
+            current.append(grad)
+            current_bytes += grad_bytes
+
+        if current:
+            buckets.append(current)
+
+        for bucket in buckets:
+            if len(bucket) == 1:
+                grad = bucket[0]
+                t0 = time.perf_counter()
+                dist.all_reduce(grad, op=dist.ReduceOp.SUM, group=group)
+                grad /= divisor
+                stats["time_sec"] += time.perf_counter() - t0
+                stats["bytes_mb"] += float(grad.numel() * grad.element_size()) / (
+                    1024.0 * 1024.0
+                )
                 continue
-            if stage.tp_size > 1:
-                dist.all_reduce(p.grad, op=dist.ReduceOp.SUM, group=tp_group)
-                p.grad /= float(stage.tp_size)
-            if stage.dp_size > 1:
-                dist.all_reduce(p.grad, op=dist.ReduceOp.SUM, group=dp_group)
-                p.grad /= float(stage.dp_size)
+
+            flat = torch.cat([g.reshape(-1) for g in bucket], dim=0)
+            t0 = time.perf_counter()
+            dist.all_reduce(flat, op=dist.ReduceOp.SUM, group=group)
+            flat /= divisor
+            stats["time_sec"] += time.perf_counter() - t0
+            stats["bytes_mb"] += float(flat.numel() * flat.element_size()) / (
+                1024.0 * 1024.0
+            )
+
+            offset = 0
+            for grad in bucket:
+                n = grad.numel()
+                grad.copy_(flat[offset : offset + n].view_as(grad))
+                offset += n
 
     def clear(self) -> None:
         self.stage_groups.clear()

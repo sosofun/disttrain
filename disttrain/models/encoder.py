@@ -4,6 +4,7 @@ from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
+import torch.utils.checkpoint as checkpoint
 
 from disttrain.config import StageConfig, TrainingConfig
 from disttrain.models.base import StageModel, TensorDict
@@ -17,6 +18,7 @@ class EncoderModel(StageModel):
         super().__init__()
         self.hidden_size = train_cfg.hidden_size
         self.input_modalities = list(stage_cfg.input_modalities)
+        self.use_activation_checkpoint = stage_cfg.activation_checkpoint
         self.text_embedding = nn.Embedding(train_cfg.vocab_size, train_cfg.hidden_size)
         self.fusion = nn.Sequential(
             nn.Linear(train_cfg.hidden_size, train_cfg.hidden_size),
@@ -64,5 +66,8 @@ class EncoderModel(StageModel):
             fused_bias = fused_bias + branch(inputs[name])
 
         hidden = hidden + fused_bias.unsqueeze(1)
-        hidden = self.fusion(hidden)
+        if self.use_activation_checkpoint and self.training:
+            hidden = checkpoint.checkpoint(self.fusion, hidden, use_reentrant=False)
+        else:
+            hidden = self.fusion(hidden)
         return {"hidden_states": hidden}

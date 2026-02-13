@@ -36,6 +36,8 @@ class StepMetrics:
     comm_time_sec: float
     comm_bytes_mb: float
     comm_bandwidth_mb_s: float
+    comm_allreduce_sec: float
+    comm_allreduce_mb: float
     comm_activation_send_sec: float
     comm_activation_recv_sec: float
     comm_gradient_send_sec: float
@@ -454,10 +456,14 @@ class TrainingEngine:
             scaler_scale: Optional[float] = (
                 float(self.scaler.get_scale()) if self.scaler is not None else None
             )
+            sync_stats = {"time_sec": 0.0, "bytes_mb": 0.0}
             if should_step:
                 if self.scaler is not None:
                     self.scaler.unscale_(self.optimizer)
-                self.group_manager.average_gradients(self.model)
+                sync_stats = self.group_manager.average_gradients(
+                    self.model,
+                    bucket_mb=self.config.distributed.grad_sync_bucket_mb,
+                )
                 if self.config.training.grad_clip_norm > 0:
                     grad_norm = torch.nn.utils.clip_grad_norm_(
                         self.model.parameters(),
@@ -472,6 +478,9 @@ class TrainingEngine:
                     self.optimizer.step()
 
             step_time = time.perf_counter() - t0
+            total_comm_time = float(out["comm_time"]) + float(sync_stats["time_sec"])
+            total_comm_mb = float(out["comm_mb"]) + float(sync_stats["bytes_mb"])
+            total_comm_bw = total_comm_mb / max(total_comm_time, 1e-6)
             tokens = (
                 self.config.training.micro_batch_size
                 * self.config.training.seq_len
@@ -498,9 +507,11 @@ class TrainingEngine:
                     tokens_per_sec=tokens_per_sec,
                     samples_per_sec=samples_per_sec,
                     bubble_ratio=self.bubble_ratio,
-                    comm_time_sec=float(out["comm_time"]),
-                    comm_bytes_mb=float(out["comm_mb"]),
-                    comm_bandwidth_mb_s=float(out["comm_bw"]),
+                    comm_time_sec=total_comm_time,
+                    comm_bytes_mb=total_comm_mb,
+                    comm_bandwidth_mb_s=total_comm_bw,
+                    comm_allreduce_sec=float(sync_stats["time_sec"]),
+                    comm_allreduce_mb=float(sync_stats["bytes_mb"]),
                     comm_activation_send_sec=float(out["comm_act_send"]),
                     comm_activation_recv_sec=float(out["comm_act_recv"]),
                     comm_gradient_send_sec=float(out["comm_grad_send"]),

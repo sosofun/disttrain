@@ -109,6 +109,9 @@ Checkpoint 恢复时默认会恢复 RNG 状态（保证可复现），如需关�
 python train.py --config configs/text_llm_only_local.yaml --resume ckpt.pt --no-restore-rng
 ```
 
+- `distributed.grad_sync_bucket_mb`：梯度 all-reduce bucket 大小（MB，`0` 表示按参数逐个同步）
+- `stages.<stage>.activation_checkpoint`：按阶段启用 activation checkpoint（true/false）
+
 ## 分布式启动示例
 
 纯文本 LLM（8 卡）：

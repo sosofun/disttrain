@@ -4,6 +4,7 @@ from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
+import torch.utils.checkpoint as checkpoint
 
 from disttrain.config import StageConfig, TrainingConfig
 from disttrain.models.base import StageModel, TensorDict
@@ -16,6 +17,7 @@ class LLMModel(StageModel):
         super().__init__()
         self.hidden_size = train_cfg.hidden_size
         self.vocab_size = train_cfg.vocab_size
+        self.use_activation_checkpoint = stage_cfg.activation_checkpoint
         self.token_embedding = nn.Embedding(train_cfg.vocab_size, train_cfg.hidden_size)
 
         self.layers = nn.ModuleList(
@@ -41,7 +43,10 @@ class LLMModel(StageModel):
             raise KeyError("LLMModel expects either 'hidden_states' or 'text_tokens'")
 
         for layer in self.layers:
-            hidden = layer(hidden)
+            if self.use_activation_checkpoint and self.training:
+                hidden = checkpoint.checkpoint(layer, hidden, use_reentrant=False)
+            else:
+                hidden = layer(hidden)
 
         logits = self.lm_head(hidden)
         return {"hidden_states": hidden, "logits": logits}

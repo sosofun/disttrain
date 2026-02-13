@@ -3,6 +3,7 @@ distributed:
   world_size: 2
   init_method: env://
   timeout_sec: 1800
+  grad_sync_bucket_mb: 8
 
 stages:
   encoder:
@@ -16,6 +17,7 @@ stages:
     tp_size: 1
     dp_size: 1
     model_cls: LLMModel
+    activation_checkpoint: true
   decoder:
     enabled: false
 

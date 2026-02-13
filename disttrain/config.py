@@ -21,6 +21,7 @@ class DistributedConfig:
     world_size: int = 0
     init_method: str = "env://"
     timeout_sec: int = 1800
+    grad_sync_bucket_mb: float = 25.0
 
 
 @dataclass
@@ -29,6 +30,7 @@ class StageConfig:
     tp_size: int = 1
     dp_size: int = 1
     model_cls: str = ""
+    activation_checkpoint: bool = False
     input_modalities: List[str] = field(default_factory=list)
     output_modalities: List[str] = field(default_factory=list)
 
@@ -128,6 +130,8 @@ class RunConfig:
                 f"configured={self.distributed.world_size}, "
                 f"expected={self.expected_world_size}"
             )
+        if self.distributed.grad_sync_bucket_mb < 0:
+            raise ConfigError("distributed.grad_sync_bucket_mb must be >= 0")
 
         if self.training.micro_batch_size < 1:
             raise ConfigError("training.micro_batch_size must be >= 1")
@@ -171,6 +175,7 @@ class RunConfig:
             world_size=int(distributed_raw.get("world_size", 0) or 0),
             init_method=str(distributed_raw.get("init_method", "env://")),
             timeout_sec=int(distributed_raw.get("timeout_sec", 1800)),
+            grad_sync_bucket_mb=float(distributed_raw.get("grad_sync_bucket_mb", 25.0)),
         )
         pipeline = PipelineConfig(
             schedule=str(pipeline_raw.get("schedule", "1f1b")).lower(),
@@ -222,6 +227,7 @@ class RunConfig:
                         }[stage_name],
                     )
                 ),
+                activation_checkpoint=bool(stage_raw.get("activation_checkpoint", False)),
                 input_modalities=[str(x) for x in stage_raw.get("input_modalities", [])],
                 output_modalities=[str(x) for x in stage_raw.get("output_modalities", [])],
             )

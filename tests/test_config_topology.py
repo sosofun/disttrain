@@ -93,6 +93,27 @@ class ConfigTopologyTests(unittest.TestCase):
         cfg = RunConfig.from_dict(raw)
         self.assertAlmostEqual(cfg.training.optimizer.stage_lrs["llm"], 3e-4)
 
+    def test_bucket_and_activation_checkpoint_flags(self) -> None:
+        raw = {
+            "distributed": {"world_size": 1, "backend": "gloo", "grad_sync_bucket_mb": 12},
+            "stages": {
+                "encoder": {"enabled": False},
+                "llm": {
+                    "enabled": True,
+                    "tp_size": 1,
+                    "dp_size": 1,
+                    "model_cls": "LLMModel",
+                    "activation_checkpoint": True,
+                },
+                "decoder": {"enabled": False},
+            },
+            "pipeline": {"schedule": "gpipe", "num_micro_batches": 2},
+            "training": {"micro_batch_size": 2, "hidden_size": 64, "seq_len": 16},
+        }
+        cfg = RunConfig.from_dict(raw)
+        self.assertEqual(cfg.distributed.grad_sync_bucket_mb, 12)
+        self.assertTrue(cfg.stages["llm"].activation_checkpoint)
+
 
 if __name__ == "__main__":
     unittest.main()
