@@ -38,7 +38,7 @@ case "${MODE}" in
       exit 1
     fi
     echo "[INFO] Run fake-data tri-stage CPU distributed training (3 processes)"
-    torchrun --standalone --nproc_per_node=3 train.py \
+    CUDA_VISIBLE_DEVICES="" torchrun --standalone --nproc_per_node=3 train.py \
       --config configs/fake_tri_stage_cpu.yaml \
       --max-steps "${STEPS}"
     ;;
