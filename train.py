@@ -144,13 +144,19 @@ def main() -> int:
             print(line)
 
     stage_cfg = cfg.stages[topology.local_stage_name]
-    base_model = build_stage_model(stage_cfg, cfg.training).to(device)
+    base_model = build_stage_model(
+        stage_cfg,
+        cfg.training,
+        tp_size=topology.local_stage.tp_size,
+        tp_rank=topology.local_tp_index(),
+    ).to(device)
     stage_lr = cfg.training.optimizer.stage_lrs.get(
         topology.local_stage_name,
         cfg.training.optimizer.lr,
     )
     group_manager = ProcessGroupManager(topology)
     group_manager.create()
+    _bind_tp_group_to_model(base_model, group_manager.local_tp_group)
     group_manager.sync_parameters(base_model)
     model = _wrap_model_with_ddp_if_needed(
         model=base_model,
@@ -357,6 +363,14 @@ def _wrap_model_with_ddp_if_needed(
             f"dp={topology.local_stage.dp_size}, bucket_cap_mb={bucket_cap_mb}"
         )
     return wrapped
+
+
+def _bind_tp_group_to_model(
+    model: torch.nn.Module,
+    tp_group: Optional[dist.ProcessGroup],
+) -> None:
+    if hasattr(model, "set_tp_group"):
+        model.set_tp_group(tp_group)  # type: ignore[misc]
 
 
 if __name__ == "__main__":

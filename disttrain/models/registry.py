@@ -20,11 +20,16 @@ def register_stage_model(name: str, cls: Type[StageModel]) -> None:
     _STAGE_MODEL_REGISTRY[name] = cls
 
 
-def build_stage_model(stage_cfg: StageConfig, train_cfg: TrainingConfig) -> StageModel:
+def build_stage_model(
+    stage_cfg: StageConfig,
+    train_cfg: TrainingConfig,
+    tp_size: int = 1,
+    tp_rank: int = 0,
+) -> StageModel:
     if stage_cfg.model_cls not in _STAGE_MODEL_REGISTRY:
         raise KeyError(
             f"unknown stage model_cls '{stage_cfg.model_cls}', "
             f"registered={sorted(_STAGE_MODEL_REGISTRY)}"
         )
     model_cls = _STAGE_MODEL_REGISTRY[stage_cfg.model_cls]
-    return model_cls(stage_cfg, train_cfg)
+    return model_cls(stage_cfg, train_cfg, tp_size=tp_size, tp_rank=tp_rank)

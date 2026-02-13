@@ -9,16 +9,31 @@ import torch.utils.checkpoint as checkpoint
 from disttrain.config import StageConfig, TrainingConfig
 from disttrain.models.base import StageModel, TensorDict
 from disttrain.models.modalities import build_decoder_modality
+from disttrain.models.tp_layers import ColumnParallelLinear
 
 
 class DecoderModel(StageModel):
     stage_name = "decoder"
 
-    def __init__(self, stage_cfg: StageConfig, train_cfg: TrainingConfig):
+    def __init__(
+        self,
+        stage_cfg: StageConfig,
+        train_cfg: TrainingConfig,
+        tp_size: int = 1,
+        tp_rank: int = 0,
+    ):
         super().__init__()
         self.output_modalities = list(stage_cfg.output_modalities)
         self.use_activation_checkpoint = stage_cfg.activation_checkpoint
-        self.text_head = nn.Linear(train_cfg.hidden_size, train_cfg.vocab_size)
+        self.tp_size = tp_size
+        self.tp_rank = tp_rank
+        self.text_head = ColumnParallelLinear(
+            train_cfg.hidden_size,
+            train_cfg.vocab_size,
+            tp_size=tp_size,
+            tp_rank=tp_rank,
+            gather_output=True,
+        )
 
         heads: Dict[str, nn.Module] = {}
         if "image" in self.output_modalities:
@@ -64,3 +79,6 @@ class DecoderModel(StageModel):
             else:
                 out["audio_pred"] = self.heads["audio"](pooled)
         return out
+
+    def set_tp_group(self, tp_group: Optional[object]) -> None:
+        self.text_head.set_tp_group(tp_group)  # type: ignore[arg-type]

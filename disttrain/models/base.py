@@ -21,3 +21,9 @@ class StageModel(nn.Module):
         self, inputs: TensorDict, meta: Optional[Dict[str, object]] = None
     ) -> TensorDict:
         raise NotImplementedError
+
+    def set_tp_group(self, tp_group: Optional[object]) -> None:
+        """
+        Optional hook for TP-capable layers.
+        """
+        del tp_group

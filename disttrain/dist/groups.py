@@ -105,7 +105,9 @@ class ProcessGroupManager:
             return
 
         for p in model.parameters():
-            dist.broadcast(p.data, src=tp_src_rank, group=tp_group)
+            is_tp_sharded = bool(getattr(p, "_tp_sharded", False))
+            if not is_tp_sharded:
+                dist.broadcast(p.data, src=tp_src_rank, group=tp_group)
             dist.broadcast(p.data, src=dp_src_rank, group=dp_group)
 
         # Keep buffers (e.g., LayerNorm running stats if any) aligned as well.
@@ -137,23 +139,31 @@ class ProcessGroupManager:
         if tp_group is None or dp_group is None:
             return stats
 
-        grads = [p.grad for p in model.parameters() if p.grad is not None]
-        if not grads:
+        tp_grads = [
+            p.grad
+            for p in model.parameters()
+            if p.grad is not None and not bool(getattr(p, "_tp_sharded", False))
+        ]
+        dp_grads = [p.grad for p in model.parameters() if p.grad is not None]
+        if not dp_grads:
             return stats
 
         if sync_tp and stage.tp_size > 1:
-            tp_stats = self._all_reduce_bucketed(
-                grads,
-                group=tp_group,
-                divisor=float(stage.tp_size),
-                bucket_mb=bucket_mb,
-            )
+            if not tp_grads:
+                tp_stats = {"time_sec": 0.0, "bytes_mb": 0.0}
+            else:
+                tp_stats = self._all_reduce_bucketed(
+                    tp_grads,
+                    group=tp_group,
+                    divisor=float(stage.tp_size),
+                    bucket_mb=bucket_mb,
+                )
             stats["time_sec"] += tp_stats["time_sec"]
             stats["bytes_mb"] += tp_stats["bytes_mb"]
 
         if sync_dp and stage.dp_size > 1:
             dp_stats = self._all_reduce_bucketed(
-                grads,
+                dp_grads,
                 group=dp_group,
                 divisor=float(stage.dp_size),
                 bucket_mb=bucket_mb,

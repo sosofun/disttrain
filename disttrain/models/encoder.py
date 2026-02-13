@@ -9,21 +9,71 @@ import torch.utils.checkpoint as checkpoint
 from disttrain.config import StageConfig, TrainingConfig
 from disttrain.models.base import StageModel, TensorDict
 from disttrain.models.modalities import build_encoder_modality
+from disttrain.models.tp_layers import (
+    ColumnParallelLinear,
+    RowParallelLinear,
+    VocabParallelEmbedding,
+)
+
+
+class TPFusionBlock(nn.Module):
+    def __init__(self, hidden_size: int, tp_size: int, tp_rank: int):
+        super().__init__()
+        self.fc1 = ColumnParallelLinear(
+            hidden_size,
+            hidden_size,
+            tp_size=tp_size,
+            tp_rank=tp_rank,
+            gather_output=False,
+        )
+        self.act = nn.GELU()
+        self.fc2 = RowParallelLinear(
+            hidden_size,
+            hidden_size,
+            tp_size=tp_size,
+            tp_rank=tp_rank,
+            input_is_parallel=True,
+        )
+        self.norm = nn.LayerNorm(hidden_size)
+
+    def set_tp_group(self, tp_group: Optional[object]) -> None:
+        self.fc1.set_tp_group(tp_group)  # type: ignore[arg-type]
+        self.fc2.set_tp_group(tp_group)  # type: ignore[arg-type]
+
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        hidden = self.fc1(hidden)
+        hidden = self.act(hidden)
+        hidden = self.fc2(hidden)
+        hidden = self.norm(hidden)
+        return hidden
 
 
 class EncoderModel(StageModel):
     stage_name = "encoder"
 
-    def __init__(self, stage_cfg: StageConfig, train_cfg: TrainingConfig):
+    def __init__(
+        self,
+        stage_cfg: StageConfig,
+        train_cfg: TrainingConfig,
+        tp_size: int = 1,
+        tp_rank: int = 0,
+    ):
         super().__init__()
         self.hidden_size = train_cfg.hidden_size
         self.input_modalities = list(stage_cfg.input_modalities)
         self.use_activation_checkpoint = stage_cfg.activation_checkpoint
-        self.text_embedding = nn.Embedding(train_cfg.vocab_size, train_cfg.hidden_size)
-        self.fusion = nn.Sequential(
-            nn.Linear(train_cfg.hidden_size, train_cfg.hidden_size),
-            nn.GELU(),
-            nn.LayerNorm(train_cfg.hidden_size),
+        self.tp_size = tp_size
+        self.tp_rank = tp_rank
+        self.text_embedding = VocabParallelEmbedding(
+            train_cfg.vocab_size,
+            train_cfg.hidden_size,
+            tp_size=tp_size,
+            tp_rank=tp_rank,
+        )
+        self.fusion = TPFusionBlock(
+            hidden_size=train_cfg.hidden_size,
+            tp_size=tp_size,
+            tp_rank=tp_rank,
         )
 
         branches: Dict[str, nn.Module] = {}
@@ -47,6 +97,10 @@ class EncoderModel(StageModel):
                 audio_length=train_cfg.audio_length,
             )
         self.branches = nn.ModuleDict(branches)
+
+    def set_tp_group(self, tp_group: Optional[object]) -> None:
+        self.text_embedding.set_tp_group(tp_group)  # type: ignore[arg-type]
+        self.fusion.set_tp_group(tp_group)  # type: ignore[arg-type]
 
     def forward(
         self, inputs: TensorDict, meta: Optional[Dict[str, object]] = None
