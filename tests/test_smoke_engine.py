@@ -7,11 +7,12 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - environment dependent
     torch = None
 
-from disttrain.config import load_config
-from disttrain.dist.groups import ProcessGroupManager
-from disttrain.dist.topology import Topology
-from disttrain.models.registry import build_stage_model
-from disttrain.pipeline.engine import TrainingEngine
+if torch is not None:
+    from disttrain.config import load_config
+    from disttrain.dist.groups import ProcessGroupManager
+    from disttrain.dist.topology import Topology
+    from disttrain.models.registry import build_stage_model
+    from disttrain.pipeline.engine import TrainingEngine
 
 
 @unittest.skipIf(torch is None, "torch is not installed in current environment")
