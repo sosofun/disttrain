@@ -8,43 +8,8 @@ import torch.utils.checkpoint as checkpoint
 
 from disttrain.config import StageConfig, TrainingConfig
 from disttrain.models.base import StageModel, TensorDict
-from disttrain.models.tp_layers import (
-    ColumnParallelLinear,
-    RowParallelLinear,
-    VocabParallelEmbedding,
-)
-
-
-class TPFeedForwardBlock(nn.Module):
-    def __init__(self, hidden_size: int, tp_size: int, tp_rank: int):
-        super().__init__()
-        self.fc1 = ColumnParallelLinear(
-            hidden_size,
-            hidden_size,
-            tp_size=tp_size,
-            tp_rank=tp_rank,
-            gather_output=False,
-        )
-        self.act = nn.GELU()
-        self.fc2 = RowParallelLinear(
-            hidden_size,
-            hidden_size,
-            tp_size=tp_size,
-            tp_rank=tp_rank,
-            input_is_parallel=True,
-        )
-        self.norm = nn.LayerNorm(hidden_size)
-
-    def set_tp_group(self, tp_group: Optional[object]) -> None:
-        self.fc1.set_tp_group(tp_group)  # type: ignore[arg-type]
-        self.fc2.set_tp_group(tp_group)  # type: ignore[arg-type]
-
-    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
-        hidden = self.fc1(hidden)
-        hidden = self.act(hidden)
-        hidden = self.fc2(hidden)
-        hidden = self.norm(hidden)
-        return hidden
+from disttrain.models.tp_layers import ColumnParallelLinear, VocabParallelEmbedding
+from disttrain.models.tp_transformer import TPTransformerBlock
 
 
 class LLMModel(StageModel):
@@ -69,13 +34,16 @@ class LLMModel(StageModel):
             tp_size=tp_size,
             tp_rank=tp_rank,
         )
+        self.norm = nn.LayerNorm(train_cfg.hidden_size)
 
         self.layers = nn.ModuleList(
             [
-                TPFeedForwardBlock(
+                TPTransformerBlock(
                     hidden_size=train_cfg.hidden_size,
+                    num_heads=train_cfg.num_attention_heads,
                     tp_size=tp_size,
                     tp_rank=tp_rank,
+                    causal=True,
                 )
                 for _ in range(2)
             ]
@@ -111,5 +79,5 @@ class LLMModel(StageModel):
             else:
                 hidden = layer(hidden)
 
-        logits = self.lm_head(hidden)
+        logits = self.lm_head(self.norm(hidden))
         return {"hidden_states": hidden, "logits": logits}

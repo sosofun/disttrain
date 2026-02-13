@@ -10,6 +10,7 @@ from disttrain.config import StageConfig, TrainingConfig
 from disttrain.models.base import StageModel, TensorDict
 from disttrain.models.modalities import build_decoder_modality
 from disttrain.models.tp_layers import ColumnParallelLinear
+from disttrain.models.tp_transformer import TPTransformerBlock
 
 
 class DecoderModel(StageModel):
@@ -34,6 +35,18 @@ class DecoderModel(StageModel):
             tp_rank=tp_rank,
             gather_output=True,
         )
+        self.blocks = nn.ModuleList(
+            [
+                TPTransformerBlock(
+                    hidden_size=train_cfg.hidden_size,
+                    num_heads=train_cfg.num_attention_heads,
+                    tp_size=tp_size,
+                    tp_rank=tp_rank,
+                    causal=False,
+                )
+            ]
+        )
+        self.norm = nn.LayerNorm(train_cfg.hidden_size)
 
         heads: Dict[str, nn.Module] = {}
         if "image" in self.output_modalities:
@@ -56,6 +69,12 @@ class DecoderModel(StageModel):
         if "hidden_states" not in inputs:
             raise KeyError("DecoderModel expects 'hidden_states'")
         hidden = inputs["hidden_states"]
+        for block in self.blocks:
+            if self.use_activation_checkpoint and self.training:
+                hidden = checkpoint.checkpoint(block, hidden, use_reentrant=False)
+            else:
+                hidden = block(hidden)
+        hidden = self.norm(hidden)
         pooled = hidden.mean(dim=1)
 
         if self.use_activation_checkpoint and self.training:
@@ -82,3 +101,5 @@ class DecoderModel(StageModel):
 
     def set_tp_group(self, tp_group: Optional[object]) -> None:
         self.text_head.set_tp_group(tp_group)  # type: ignore[arg-type]
+        for block in self.blocks:
+            block.set_tp_group(tp_group)

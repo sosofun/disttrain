@@ -17,6 +17,42 @@ def _mark_tp_sharded(param: torch.nn.Parameter) -> None:
     setattr(param, "_tp_sharded", True)
 
 
+def _all_reduce_autograd(
+    tensor: torch.Tensor,
+    group: Optional[dist.ProcessGroup],
+) -> torch.Tensor:
+    if group is None or not (dist.is_available() and dist.is_initialized()):
+        return tensor
+    try:
+        from torch.distributed.nn import functional as dist_nn_f  # type: ignore
+
+        return dist_nn_f.all_reduce(tensor, op=dist.ReduceOp.SUM, group=group)
+    except Exception:
+        out = tensor.clone()
+        dist.all_reduce(out, op=dist.ReduceOp.SUM, group=group)
+        return out
+
+
+def _all_gather_autograd(
+    tensor: torch.Tensor,
+    group: Optional[dist.ProcessGroup],
+    world_size: int,
+) -> torch.Tensor:
+    if world_size == 1 or group is None or not (dist.is_available() and dist.is_initialized()):
+        return tensor
+    try:
+        from torch.distributed.nn import functional as dist_nn_f  # type: ignore
+
+        gathered = dist_nn_f.all_gather(tensor, group=group)
+        if isinstance(gathered, (tuple, list)):
+            return torch.cat(list(gathered), dim=-1)
+        return gathered
+    except Exception:
+        gathered_list = [torch.empty_like(tensor) for _ in range(world_size)]
+        dist.all_gather(gathered_list, tensor, group=group)
+        return torch.cat(gathered_list, dim=-1)
+
+
 class VocabParallelEmbedding(nn.Module):
     def __init__(
         self,
@@ -54,7 +90,7 @@ class VocabParallelEmbedding(nn.Module):
         out = out.masked_fill(mask.unsqueeze(-1), 0.0)
 
         if dist.is_available() and dist.is_initialized() and self.tp_group is not None:
-            dist.all_reduce(out, op=dist.ReduceOp.SUM, group=self.tp_group)
+            out = _all_reduce_autograd(out, self.tp_group)
         return out
 
 
@@ -93,13 +129,9 @@ class ColumnParallelLinear(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = F.linear(x, self.weight, self.bias)
-        if not self.gather_output or self.tp_size == 1:
+        if not self.gather_output:
             return out
-        if not (dist.is_available() and dist.is_initialized() and self.tp_group is not None):
-            return out
-        gathered = [torch.empty_like(out) for _ in range(self.tp_size)]
-        dist.all_gather(gathered, out, group=self.tp_group)
-        return torch.cat(gathered, dim=-1)
+        return _all_gather_autograd(out, self.tp_group, world_size=self.tp_size)
 
 
 class RowParallelLinear(nn.Module):
@@ -143,7 +175,7 @@ class RowParallelLinear(nn.Module):
             x_local = x[..., start:end]
         out = F.linear(x_local, self.weight, None)
         if self.tp_size > 1 and dist.is_available() and dist.is_initialized() and self.tp_group is not None:
-            dist.all_reduce(out, op=dist.ReduceOp.SUM, group=self.tp_group)
+            out = _all_reduce_autograd(out, self.tp_group)
         if self.bias is not None:
             out = out + self.bias
         return out

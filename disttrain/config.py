@@ -68,6 +68,7 @@ class TrainingConfig:
     seq_len: int = 128
     vocab_size: int = 32000
     hidden_size: int = 512
+    num_attention_heads: int = 8
     image_size: int = 64
     video_frames: int = 8
     audio_length: int = 2048
@@ -149,6 +150,14 @@ class RunConfig:
             raise ConfigError("training.grad_accum_steps must be >= 1")
         if self.training.hidden_size < 1:
             raise ConfigError("training.hidden_size must be >= 1")
+        if self.training.num_attention_heads < 1:
+            raise ConfigError("training.num_attention_heads must be >= 1")
+        if self.training.hidden_size % self.training.num_attention_heads != 0:
+            raise ConfigError(
+                "training.hidden_size must be divisible by training.num_attention_heads, "
+                f"got hidden_size={self.training.hidden_size}, "
+                f"num_attention_heads={self.training.num_attention_heads}"
+            )
         if self.training.seq_len < 1:
             raise ConfigError("training.seq_len must be >= 1")
         if self.training.data_seed < 0:
@@ -167,6 +176,17 @@ class RunConfig:
 
         if self.training.optimizer.type.lower() != "adamw":
             raise ConfigError("training.optimizer.type currently only supports 'adamw'")
+        for stage_name in STAGE_ORDER:
+            stage = self.stages[stage_name]
+            if not stage.enabled:
+                continue
+            if self.training.num_attention_heads % stage.tp_size != 0:
+                raise ConfigError(
+                    "training.num_attention_heads must be divisible by stage tp_size "
+                    f"for enabled stage '{stage_name}', got "
+                    f"num_attention_heads={self.training.num_attention_heads}, "
+                    f"tp_size={stage.tp_size}"
+                )
         for k, v in self.training.optimizer.stage_lrs.items():
             if k not in STAGE_ORDER:
                 raise ConfigError(
@@ -226,6 +246,7 @@ class RunConfig:
             seq_len=int(training_raw.get("seq_len", 128)),
             vocab_size=int(training_raw.get("vocab_size", 32000)),
             hidden_size=int(training_raw.get("hidden_size", 512)),
+            num_attention_heads=int(training_raw.get("num_attention_heads", 8)),
             image_size=int(training_raw.get("image_size", 64)),
             video_frames=int(training_raw.get("video_frames", 8)),
             audio_length=int(training_raw.get("audio_length", 2048)),

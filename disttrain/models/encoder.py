@@ -9,43 +9,8 @@ import torch.utils.checkpoint as checkpoint
 from disttrain.config import StageConfig, TrainingConfig
 from disttrain.models.base import StageModel, TensorDict
 from disttrain.models.modalities import build_encoder_modality
-from disttrain.models.tp_layers import (
-    ColumnParallelLinear,
-    RowParallelLinear,
-    VocabParallelEmbedding,
-)
-
-
-class TPFusionBlock(nn.Module):
-    def __init__(self, hidden_size: int, tp_size: int, tp_rank: int):
-        super().__init__()
-        self.fc1 = ColumnParallelLinear(
-            hidden_size,
-            hidden_size,
-            tp_size=tp_size,
-            tp_rank=tp_rank,
-            gather_output=False,
-        )
-        self.act = nn.GELU()
-        self.fc2 = RowParallelLinear(
-            hidden_size,
-            hidden_size,
-            tp_size=tp_size,
-            tp_rank=tp_rank,
-            input_is_parallel=True,
-        )
-        self.norm = nn.LayerNorm(hidden_size)
-
-    def set_tp_group(self, tp_group: Optional[object]) -> None:
-        self.fc1.set_tp_group(tp_group)  # type: ignore[arg-type]
-        self.fc2.set_tp_group(tp_group)  # type: ignore[arg-type]
-
-    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
-        hidden = self.fc1(hidden)
-        hidden = self.act(hidden)
-        hidden = self.fc2(hidden)
-        hidden = self.norm(hidden)
-        return hidden
+from disttrain.models.tp_layers import VocabParallelEmbedding
+from disttrain.models.tp_transformer import TPTransformerBlock
 
 
 class EncoderModel(StageModel):
@@ -70,11 +35,18 @@ class EncoderModel(StageModel):
             tp_size=tp_size,
             tp_rank=tp_rank,
         )
-        self.fusion = TPFusionBlock(
-            hidden_size=train_cfg.hidden_size,
-            tp_size=tp_size,
-            tp_rank=tp_rank,
+        self.blocks = nn.ModuleList(
+            [
+                TPTransformerBlock(
+                    hidden_size=train_cfg.hidden_size,
+                    num_heads=train_cfg.num_attention_heads,
+                    tp_size=tp_size,
+                    tp_rank=tp_rank,
+                    causal=False,
+                )
+            ]
         )
+        self.norm = nn.LayerNorm(train_cfg.hidden_size)
 
         branches: Dict[str, nn.Module] = {}
         if "image" in self.input_modalities:
@@ -100,7 +72,8 @@ class EncoderModel(StageModel):
 
     def set_tp_group(self, tp_group: Optional[object]) -> None:
         self.text_embedding.set_tp_group(tp_group)  # type: ignore[arg-type]
-        self.fusion.set_tp_group(tp_group)  # type: ignore[arg-type]
+        for block in self.blocks:
+            block.set_tp_group(tp_group)
 
     def forward(
         self, inputs: TensorDict, meta: Optional[Dict[str, object]] = None
@@ -120,8 +93,10 @@ class EncoderModel(StageModel):
             fused_bias = fused_bias + branch(inputs[name])
 
         hidden = hidden + fused_bias.unsqueeze(1)
-        if self.use_activation_checkpoint and self.training:
-            hidden = checkpoint.checkpoint(self.fusion, hidden, use_reentrant=False)
-        else:
-            hidden = self.fusion(hidden)
+        for block in self.blocks:
+            if self.use_activation_checkpoint and self.training:
+                hidden = checkpoint.checkpoint(block, hidden, use_reentrant=False)
+            else:
+                hidden = block(hidden)
+        hidden = self.norm(hidden)
         return {"hidden_states": hidden}
