@@ -279,7 +279,8 @@ class TrainingEngine:
 
     def _compute_loss(self, outputs: TensorDict) -> torch.Tensor:
         cfg = self.config.training
-        losses: List[torch.Tensor] = []
+        weighted_losses: List[Tuple[str, torch.Tensor, float]] = []
+        loss_weights = cfg.loss_weights
 
         if "text_logits" in outputs:
             logits = outputs["text_logits"]
@@ -290,7 +291,8 @@ class TrainingEngine:
                 device=logits.device,
                 dtype=torch.long,
             )
-            losses.append(F.cross_entropy(logits.reshape(-1, logits.size(-1)), labels.reshape(-1)))
+            text_loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), labels.reshape(-1))
+            weighted_losses.append(("text", text_loss, float(loss_weights.get("text", 1.0))))
         elif "logits" in outputs:
             logits = outputs["logits"]
             labels = torch.randint(
@@ -300,19 +302,27 @@ class TrainingEngine:
                 device=logits.device,
                 dtype=torch.long,
             )
-            losses.append(F.cross_entropy(logits.reshape(-1, logits.size(-1)), labels.reshape(-1)))
+            text_loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), labels.reshape(-1))
+            weighted_losses.append(("text", text_loss, float(loss_weights.get("text", 1.0))))
 
         if "image_pred" in outputs:
             image_target = torch.zeros_like(outputs["image_pred"])
-            losses.append(F.mse_loss(outputs["image_pred"], image_target))
+            image_loss = F.mse_loss(outputs["image_pred"], image_target)
+            weighted_losses.append(("image", image_loss, float(loss_weights.get("image", 1.0))))
         if "audio_pred" in outputs:
             audio_target = torch.zeros_like(outputs["audio_pred"])
-            losses.append(F.mse_loss(outputs["audio_pred"], audio_target))
+            audio_loss = F.mse_loss(outputs["audio_pred"], audio_target)
+            weighted_losses.append(("audio", audio_loss, float(loss_weights.get("audio", 1.0))))
 
-        if not losses:
+        if not weighted_losses:
             raise RuntimeError("loss is empty: sink stage produced no supervised outputs")
-
-        total = sum(losses) / float(len(losses))
+        active = [(name, loss, w) for name, loss, w in weighted_losses if w > 0]
+        if not active:
+            raise RuntimeError(
+                "all active output losses are disabled by zero weights in training.loss_weights"
+            )
+        denom = sum(w for _name, _loss, w in active)
+        total = sum(loss * w for _name, loss, w in active) / max(float(denom), 1e-12)
         return total / float(self.config.training.grad_accum_steps)
 
     def _forward_micro_batch(self, step: int, micro_batch_idx: int) -> float:

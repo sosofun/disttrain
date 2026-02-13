@@ -84,19 +84,59 @@ def _validate_checkpoint_topology(meta: Dict[str, Any], topology: Topology) -> N
     ckpt_enabled = meta.get("enabled_stages", [])
     cur_enabled = topology.enabled_stage_names
     if list(ckpt_enabled) != list(cur_enabled):
+        suggestion = _enabled_stage_mismatch_suggestion(ckpt_enabled, cur_enabled)
         raise ValueError(
-            f"checkpoint enabled_stages mismatch: ckpt={ckpt_enabled}, runtime={cur_enabled}"
+            "checkpoint enabled_stages mismatch: "
+            f"ckpt={ckpt_enabled}, runtime={cur_enabled}. {suggestion}"
         )
     ckpt_stage = meta.get("stage_tp_dp", {})
     for stage_name in cur_enabled:
         cur = topology.stages[stage_name]
         ck = ckpt_stage.get(stage_name, {})
-        if int(ck.get("tp_size", -1)) != cur.tp_size or int(ck.get("dp_size", -1)) != cur.dp_size:
+        ck_tp = int(ck.get("tp_size", -1))
+        ck_dp = int(ck.get("dp_size", -1))
+        if ck_tp != cur.tp_size or ck_dp != cur.dp_size:
+            suggestion = _stage_topology_mismatch_suggestion(
+                stage_name=stage_name,
+                ck_tp=ck_tp,
+                ck_dp=ck_dp,
+                rt_tp=cur.tp_size,
+                rt_dp=cur.dp_size,
+            )
             raise ValueError(
                 f"checkpoint stage topology mismatch at {stage_name}: "
-                f"ckpt(tp,dp)=({ck.get('tp_size')},{ck.get('dp_size')}), "
-                f"runtime(tp,dp)=({cur.tp_size},{cur.dp_size})"
+                f"ckpt(tp,dp)=({ck_tp},{ck_dp}), "
+                f"runtime(tp,dp)=({cur.tp_size},{cur.dp_size}). {suggestion}"
             )
+
+
+def _enabled_stage_mismatch_suggestion(ckpt_enabled: Any, runtime_enabled: Any) -> str:
+    return (
+        "建议：优先使用与 checkpoint 一致的 enabled_stages 进行恢复；"
+        f"即将当前配置调整为 {list(ckpt_enabled)}。"
+        "如需跨拓扑迁移，请先离线转换 checkpoint 后再 load。"
+    )
+
+
+def _stage_topology_mismatch_suggestion(
+    stage_name: str,
+    ck_tp: int,
+    ck_dp: int,
+    rt_tp: int,
+    rt_dp: int,
+) -> str:
+    ck_world = ck_tp * ck_dp if ck_tp > 0 and ck_dp > 0 else -1
+    rt_world = rt_tp * rt_dp if rt_tp > 0 and rt_dp > 0 else -1
+    if ck_world == rt_world and ck_world > 0:
+        return (
+            f"建议：{stage_name} 的 stage_world_size 一致（{ck_world}），"
+            "可做离线重分片映射后恢复（TP/DP 维度重排）。"
+        )
+    return (
+        f"建议：{stage_name} 的 stage_world_size 不一致（ckpt={ck_world}, runtime={rt_world}），"
+        "无法直接重映射恢复。请使用与 checkpoint 相同 tp/dp 配置恢复，"
+        "或仅加载模型参数重新开始训练。"
+    )
 
 
 def _capture_rng_state() -> Dict[str, Any]:

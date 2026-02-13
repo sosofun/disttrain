@@ -9,6 +9,7 @@ import json
 STAGE_ORDER = ("encoder", "llm", "decoder")
 VALID_MODALITIES = {"text", "image", "video", "audio"}
 VALID_SCHEDULES = {"gpipe", "1f1b"}
+VALID_LOSS_WEIGHT_KEYS = {"text", "image", "audio"}
 
 
 class ConfigError(ValueError):
@@ -75,6 +76,9 @@ class TrainingConfig:
     video_frames: int = 8
     audio_length: int = 2048
     data_seed: int = 2026
+    loss_weights: Dict[str, float] = field(
+        default_factory=lambda: {"text": 1.0, "image": 1.0, "audio": 1.0}
+    )
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
     io: "IOConfig" = field(default_factory=lambda: IOConfig())
 
@@ -180,6 +184,22 @@ class RunConfig:
             raise ConfigError("training.io.prefetch_size must be >= 0")
         if self.training.io.num_workers < 0:
             raise ConfigError("training.io.num_workers must be >= 0")
+        if not self.training.loss_weights:
+            raise ConfigError("training.loss_weights cannot be empty")
+        total_loss_weight = 0.0
+        for k, v in self.training.loss_weights.items():
+            if k not in VALID_LOSS_WEIGHT_KEYS:
+                raise ConfigError(
+                    "training.loss_weights contains invalid key "
+                    f"'{k}', expected one of {sorted(VALID_LOSS_WEIGHT_KEYS)}"
+                )
+            if v < 0:
+                raise ConfigError(
+                    f"training.loss_weights.{k} must be >= 0, got {v}"
+                )
+            total_loss_weight += float(v)
+        if total_loss_weight <= 0:
+            raise ConfigError("sum(training.loss_weights.values()) must be > 0")
 
         if self.training.optimizer.type.lower() != "adamw":
             raise ConfigError("training.optimizer.type currently only supports 'adamw'")
@@ -232,6 +252,12 @@ class RunConfig:
         )
         optimizer_raw = training_raw.get("optimizer", {})
         io_raw = training_raw.get("io", {})
+        loss_weights_raw = training_raw.get("loss_weights", {})
+        if loss_weights_raw is None:
+            loss_weights_raw = {}
+        loss_weights = {"text": 1.0, "image": 1.0, "audio": 1.0}
+        for k, v in dict(loss_weights_raw).items():
+            loss_weights[str(k)] = float(v)
         optimizer = OptimizerConfig(
             type=str(optimizer_raw.get("type", "adamw")),
             lr=float(optimizer_raw.get("lr", 2e-4)),
@@ -264,6 +290,7 @@ class RunConfig:
             video_frames=int(training_raw.get("video_frames", 8)),
             audio_length=int(training_raw.get("audio_length", 2048)),
             data_seed=int(training_raw.get("data_seed", 2026)),
+            loss_weights=loss_weights,
             optimizer=optimizer,
             io=io_cfg,
         )

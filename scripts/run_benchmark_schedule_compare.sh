@@ -12,6 +12,9 @@ STEPS="${STEPS:-8}"
 WARMUP_STEPS="${WARMUP_STEPS:-2}"
 FORCE_CPU="${FORCE_CPU:-1}"
 TIMEOUT_SEC="${TIMEOUT_SEC:-300}"
+REQUIRE_1F1B_NOT_WORSE="${REQUIRE_1F1B_NOT_WORSE:-1}"
+TOKENS_RATIO_MIN="${TOKENS_RATIO_MIN:-0.98}"
+STEP_TIME_RATIO_MAX="${STEP_TIME_RATIO_MAX:-1.02}"
 RUN_ID="$(date +%Y%m%d_%H%M%S)"
 LOG_DIR="${LOG_DIR:-${REPO_ROOT}/artifacts/benchmark/schedule_compare_${RUN_ID}}"
 TMP_DIR="${LOG_DIR}/tmp_configs"
@@ -76,7 +79,7 @@ _e2e_run_case \
   "${TIMEOUT_SEC}" \
   "${FORCE_CPU}"
 
-python3 - "${LOG_DIR}" "${NPROC}" "${WARMUP_STEPS}" <<'PY'
+python3 - "${LOG_DIR}" "${NPROC}" "${WARMUP_STEPS}" "${REQUIRE_1F1B_NOT_WORSE}" "${TOKENS_RATIO_MIN}" "${STEP_TIME_RATIO_MAX}" <<'PY'
 import json
 from pathlib import Path
 import statistics
@@ -85,6 +88,9 @@ import sys
 log_dir = Path(sys.argv[1])
 nproc = int(sys.argv[2])
 warmup = int(sys.argv[3])
+require_gate = int(sys.argv[4]) == 1
+tokens_ratio_min = float(sys.argv[5])
+step_time_ratio_max = float(sys.argv[6])
 
 files = {
     "gpipe": log_dir / f"benchmark-gpipe-{nproc}p.metrics.jsonl",
@@ -165,6 +171,25 @@ md_path.write_text("\n".join(md) + "\n", encoding="utf-8")
 
 print(f"[INFO] report json: {json_path}")
 print(f"[INFO] report md  : {md_path}")
+
+if require_gate:
+    if report["ratio_1f1b_vs_gpipe_tokens_per_sec"] < tokens_ratio_min:
+        print(
+            "[ERROR] benchmark gate failed: 1f1b tokens/s ratio is below threshold: "
+            f"{report['ratio_1f1b_vs_gpipe_tokens_per_sec']:.4f} < {tokens_ratio_min:.4f}"
+        )
+        sys.exit(2)
+    if report["ratio_1f1b_vs_gpipe_step_time"] > step_time_ratio_max:
+        print(
+            "[ERROR] benchmark gate failed: 1f1b step-time ratio is above threshold: "
+            f"{report['ratio_1f1b_vs_gpipe_step_time']:.4f} > {step_time_ratio_max:.4f}"
+        )
+        sys.exit(2)
+    print(
+        "[INFO] benchmark gate passed: "
+        f"tokens_ratio={report['ratio_1f1b_vs_gpipe_tokens_per_sec']:.4f}, "
+        f"step_time_ratio={report['ratio_1f1b_vs_gpipe_step_time']:.4f}"
+    )
 PY
 
 echo "[INFO] Schedule benchmark compare finished."

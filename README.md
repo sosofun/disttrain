@@ -92,6 +92,12 @@ ZeRO-1 分布式优化器专项回归（2 进程 LLM-only，校验 `sync_impl` �
 bash scripts/run_e2e_zero1_dp_optim.sh
 ```
 
+1F1B 100+ steps 稳定性回归（默认 120 steps，校验 optimizer-step 记录数与数值有限性）：
+
+```bash
+bash scripts/run_e2e_1f1b_100_steps.sh
+```
+
 GPipe vs 1F1B 自动基线对比（导出 json + md 报告）：
 
 ```bash
@@ -110,6 +116,9 @@ bash scripts/run_benchmark_sp_compare.sh
 - `FORCE_CPU=1`：默认开启，强制 CPU（避免 Gloo + CUDA 混用）
 - `TIMEOUT_SEC=240`：单 case 超时时间（秒）
 - `LOG_DIR=/path/to/logs`：日志输出目录
+- `REQUIRE_1F1B_NOT_WORSE=1`：benchmark 门禁，要求 1F1B 不劣于 GPipe（可关闭为 0）
+- `TOKENS_RATIO_MIN=0.98`：`1f1b/gpipe` 最低 tokens/s 比例
+- `STEP_TIME_RATIO_MAX=1.02`：`1f1b/gpipe` 最高 step_time 比例
 
 ## 训练配置补充项
 
@@ -137,6 +146,18 @@ python train.py --config configs/text_llm_only_local.yaml --resume ckpt.pt --no-
 - `training.optimizer.zero_stage`：优化器分片等级，当前支持：
   - `0`：常规 AdamW（默认）
   - `1`：ZeRO-1 Distributed Optimizer（连续参数/主梯度 buffer + `reduce_scatter/all_gather`）
+- `training.loss_weights`：多任务损失权重，支持键：`text/image/audio`，示例：
+
+```yaml
+training:
+  loss_weights:
+    text: 1.0
+    image: 0.3
+    audio: 0.5
+```
+
+> 训练时会按启用输出分支做加权归一化：`sum(w_i * loss_i) / sum(w_i)`（仅统计 `w_i > 0` 的分支）。
+
 - `stages.<stage>.activation_checkpoint`：按阶段启用 activation checkpoint（true/false）
 - `stages.<stage>.sequence_parallel`：在 TP 基础上启用序列并行（要求 `tp_size > 1`）
 - `training.io`：I/O 占位优化开关（prefetch/pin_memory）：

@@ -184,6 +184,64 @@ class ConfigTopologyTests(unittest.TestCase):
         with self.assertRaises(ConfigError):
             RunConfig.from_dict(raw)
 
+    def test_loss_weights_parse(self) -> None:
+        raw = {
+            "distributed": {"world_size": 1, "backend": "gloo"},
+            "stages": {
+                "encoder": {"enabled": False},
+                "llm": {"enabled": True, "tp_size": 1, "dp_size": 1, "model_cls": "LLMModel"},
+                "decoder": {"enabled": False},
+            },
+            "pipeline": {"schedule": "gpipe", "num_micro_batches": 2},
+            "training": {
+                "micro_batch_size": 2,
+                "hidden_size": 64,
+                "seq_len": 16,
+                "loss_weights": {"text": 1.0, "image": 0.25, "audio": 0.5},
+            },
+        }
+        cfg = RunConfig.from_dict(raw)
+        self.assertAlmostEqual(cfg.training.loss_weights["image"], 0.25)
+        self.assertAlmostEqual(cfg.training.loss_weights["audio"], 0.5)
+
+    def test_loss_weights_invalid_key(self) -> None:
+        raw = {
+            "distributed": {"world_size": 1, "backend": "gloo"},
+            "stages": {
+                "encoder": {"enabled": False},
+                "llm": {"enabled": True, "tp_size": 1, "dp_size": 1, "model_cls": "LLMModel"},
+                "decoder": {"enabled": False},
+            },
+            "pipeline": {"schedule": "gpipe", "num_micro_batches": 2},
+            "training": {
+                "micro_batch_size": 2,
+                "hidden_size": 64,
+                "seq_len": 16,
+                "loss_weights": {"video": 1.0},
+            },
+        }
+        with self.assertRaises(ConfigError):
+            RunConfig.from_dict(raw)
+
+    def test_loss_weights_must_not_be_all_zero(self) -> None:
+        raw = {
+            "distributed": {"world_size": 1, "backend": "gloo"},
+            "stages": {
+                "encoder": {"enabled": False},
+                "llm": {"enabled": True, "tp_size": 1, "dp_size": 1, "model_cls": "LLMModel"},
+                "decoder": {"enabled": False},
+            },
+            "pipeline": {"schedule": "gpipe", "num_micro_batches": 2},
+            "training": {
+                "micro_batch_size": 2,
+                "hidden_size": 64,
+                "seq_len": 16,
+                "loss_weights": {"text": 0.0, "image": 0.0, "audio": 0.0},
+            },
+        }
+        with self.assertRaises(ConfigError):
+            RunConfig.from_dict(raw)
+
 
 if __name__ == "__main__":
     unittest.main()
