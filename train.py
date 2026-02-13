@@ -389,6 +389,12 @@ def _build_optimizer(
                     )
                 )
             return optimizer
+    if zero_stage == 1 and topology.runtime_rank == 0:
+        print(
+            "[WARN] training.optimizer.zero_stage=1 requested but not activated "
+            f"for stage={topology.local_stage_name} (dp_size={topology.local_stage.dp_size}). "
+            "Falling back to AdamW."
+        )
     return torch.optim.AdamW(
         params,
         lr=lr,
