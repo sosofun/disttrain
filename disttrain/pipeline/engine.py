@@ -96,6 +96,7 @@ class TrainingEngine:
             self.autocast_dtype = torch.float16
         else:
             self.autocast_dtype = torch.float32
+        self.transport_dtype = self._resolve_transport_dtype()
 
         self.bubble_ratio = theoretical_bubble_ratio(
             pipeline_depth=self.pipeline_depth,
@@ -130,6 +131,31 @@ class TrainingEngine:
 
     def _dist_ready(self) -> bool:
         return dist.is_available() and dist.is_initialized()
+
+    def _resolve_transport_dtype(self) -> torch.dtype:
+        raw = self.config.pipeline.transport_dtype
+        dtype_map = {
+            "fp32": torch.float32,
+            "fp16": torch.float16,
+            "bf16": torch.bfloat16,
+        }
+        if raw == "auto":
+            if self.device.type == "cuda":
+                if self.config.training.precision == "bf16":
+                    return torch.bfloat16
+                if self.config.training.precision == "fp16":
+                    return torch.float16
+            return torch.float32
+
+        chosen = dtype_map[raw]
+        if self.device.type != "cuda" and chosen != torch.float32:
+            if self.topology.runtime_rank == 0:
+                print(
+                    "[WARN] non-CUDA device does not use low-precision transport, "
+                    f"fallback transport dtype {raw} -> fp32."
+                )
+            return torch.float32
+        return chosen
 
     def _transport_rank(self) -> bool:
         # Each TP replica group uses tp_idx=0 as the cross-stage transport rank.
@@ -201,7 +227,7 @@ class TrainingEngine:
             t0 = time.perf_counter()
             tensor, _ = recv_tensor(
                 shape=shape,
-                dtype=torch.float32,
+                dtype=self.transport_dtype,
                 device=self.device,
                 src_rank=src_rank,
                 tag=activation_tag(step, micro_batch_idx),
@@ -209,8 +235,10 @@ class TrainingEngine:
             )
             self._record_comm("act_recv", time.perf_counter() - t0, tensor)
         else:
-            tensor = torch.empty(shape, dtype=torch.float32, device=self.device)
+            tensor = torch.empty(shape, dtype=self.transport_dtype, device=self.device)
         self._tp_broadcast(tensor)
+        if tensor.dtype != torch.float32:
+            tensor = tensor.to(dtype=torch.float32)
         tensor.requires_grad_(True)
         return tensor
 
@@ -221,14 +249,17 @@ class TrainingEngine:
         if dst_rank is None:
             raise RuntimeError("next stage is missing for activation send")
         use_async = self.config.pipeline.overlap_p2p_comm or self._force_async_p2p
+        payload = hidden
+        if hidden.dtype != self.transport_dtype:
+            payload = hidden.to(dtype=self.transport_dtype)
         t0 = time.perf_counter()
         work = send_tensor(
-            tensor=hidden,
+            tensor=payload,
             dst_rank=dst_rank,
             tag=activation_tag(step, micro_batch_idx),
             async_op=use_async,
         )
-        self._record_comm("act_send", time.perf_counter() - t0, hidden)
+        self._record_comm("act_send", time.perf_counter() - t0, payload)
         if work is not None:
             self.pending_works.append(work)
 
@@ -242,7 +273,7 @@ class TrainingEngine:
             t0 = time.perf_counter()
             grad, _ = recv_tensor(
                 shape=shape,
-                dtype=torch.float32,
+                dtype=self.transport_dtype,
                 device=self.device,
                 src_rank=src_rank,
                 tag=gradient_tag(step, micro_batch_idx),
@@ -250,8 +281,10 @@ class TrainingEngine:
             )
             self._record_comm("grad_recv", time.perf_counter() - t0, grad)
         else:
-            grad = torch.empty(shape, dtype=torch.float32, device=self.device)
+            grad = torch.empty(shape, dtype=self.transport_dtype, device=self.device)
         self._tp_broadcast(grad)
+        if grad.dtype != torch.float32:
+            grad = grad.to(dtype=torch.float32)
         return grad
 
     def _send_gradient(self, grad: torch.Tensor, step: int, micro_batch_idx: int) -> None:
@@ -268,14 +301,17 @@ class TrainingEngine:
         if dst_rank is None:
             raise RuntimeError("prev stage is missing for gradient send")
         use_async = self.config.pipeline.overlap_p2p_comm or self._force_async_p2p
+        payload = grad
+        if grad.dtype != self.transport_dtype:
+            payload = grad.to(dtype=self.transport_dtype)
         t0 = time.perf_counter()
         work = send_tensor(
-            tensor=grad,
+            tensor=payload,
             dst_rank=dst_rank,
             tag=gradient_tag(step, micro_batch_idx),
             async_op=use_async,
         )
-        self._record_comm("grad_send", time.perf_counter() - t0, grad)
+        self._record_comm("grad_send", time.perf_counter() - t0, payload)
         if work is not None:
             self.pending_works.append(work)
 

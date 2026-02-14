@@ -167,6 +167,8 @@ python train.py --config configs/text_llm_only_local.yaml --deterministic
 ```
 
 - `distributed.grad_sync_bucket_mb`：梯度 all-reduce bucket 大小（MB，`0` 表示按参数逐个同步）
+- `pipeline.transport_dtype`：跨阶段激活/梯度传输 dtype，支持 `auto/fp32/fp16/bf16`
+  - `auto`（默认）：CUDA 下随训练精度选择（bf16/fp16），CPU 下回退 fp32
 - `training.deterministic`：是否启用确定性模式（默认 `false`）
   - 开启后会设置 `torch.use_deterministic_algorithms(True)`、`cudnn.deterministic=True`、
     `cudnn.benchmark=False`、关闭 TF32，并设置 `CUBLAS_WORKSPACE_CONFIG=:4096:8`

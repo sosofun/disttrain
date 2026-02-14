@@ -9,6 +9,7 @@ import json
 STAGE_ORDER = ("encoder", "llm", "decoder")
 VALID_MODALITIES = {"text", "image", "video", "audio"}
 VALID_SCHEDULES = {"gpipe", "1f1b"}
+VALID_TRANSPORT_DTYPES = {"auto", "fp32", "fp16", "bf16"}
 VALID_LOSS_WEIGHT_KEYS = {"text", "image", "audio"}
 
 
@@ -48,6 +49,7 @@ class PipelineConfig:
     schedule: str = "1f1b"
     num_micro_batches: int = 8
     overlap_p2p_comm: bool = True
+    transport_dtype: str = "auto"
 
 
 @dataclass
@@ -134,6 +136,11 @@ class RunConfig:
             raise ConfigError(
                 f"pipeline.schedule must be one of {sorted(VALID_SCHEDULES)}, "
                 f"got {self.pipeline.schedule}"
+            )
+        if self.pipeline.transport_dtype not in VALID_TRANSPORT_DTYPES:
+            raise ConfigError(
+                "pipeline.transport_dtype must be one of "
+                f"{sorted(VALID_TRANSPORT_DTYPES)}, got {self.pipeline.transport_dtype}"
             )
         if self.pipeline.num_micro_batches < 1:
             raise ConfigError("pipeline.num_micro_batches must be >= 1")
@@ -250,6 +257,7 @@ class RunConfig:
             schedule=str(pipeline_raw.get("schedule", "1f1b")).lower(),
             num_micro_batches=int(pipeline_raw.get("num_micro_batches", 8)),
             overlap_p2p_comm=bool(pipeline_raw.get("overlap_p2p_comm", True)),
+            transport_dtype=str(pipeline_raw.get("transport_dtype", "auto")).lower(),
         )
         optimizer_raw = training_raw.get("optimizer", {})
         io_raw = training_raw.get("io", {})

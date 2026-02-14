@@ -73,15 +73,26 @@ class TPSelfAttention(nn.Module):
         k = k.view(batch, seq, self.local_heads, self.head_dim).transpose(1, 2)
         v = v.view(batch, seq, self.local_heads, self.head_dim).transpose(1, 2)
 
-        scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-        if self.causal:
-            mask = torch.triu(
-                torch.ones(seq, seq, device=scores.device, dtype=torch.bool), diagonal=1
+        # Prefer SDPA fused kernel path for better throughput/memory behavior.
+        try:
+            ctx = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=None,
+                dropout_p=0.0,
+                is_causal=self.causal,
             )
-            scores = scores.masked_fill(mask, float("-inf"))
-
-        probs = F.softmax(scores, dim=-1)
-        ctx = torch.matmul(probs, v)
+        except Exception:
+            # Compatibility fallback for environments without SDPA support.
+            scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+            if self.causal:
+                mask = torch.triu(
+                    torch.ones(seq, seq, device=scores.device, dtype=torch.bool), diagonal=1
+                )
+                scores = scores.masked_fill(mask, float("-inf"))
+            probs = F.softmax(scores, dim=-1)
+            ctx = torch.matmul(probs, v)
         ctx = ctx.transpose(1, 2).contiguous().view(batch, seq, self.local_hidden)
         out = self.out_proj(ctx)
         return out
