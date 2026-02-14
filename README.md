@@ -35,6 +35,19 @@ train.py
 python train.py --config configs/text_llm_only_local.yaml --max-steps 2
 ```
 
+metrics profile 快速切换（可直接运行）：
+
+```bash
+# 低开销训练日志（minimal）
+python train.py --config configs/fake_llm_local_metrics_train.yaml
+
+# 基准对比（standard）
+python train.py --config configs/fake_llm_local_metrics_benchmark.yaml
+
+# 诊断分析（detailed, all ranks）
+python train.py --config configs/fake_llm_local_metrics_diagnose.yaml --log-format json
+```
+
 支持 JSON 日志格式（便于接入监控）：
 
 ```bash
