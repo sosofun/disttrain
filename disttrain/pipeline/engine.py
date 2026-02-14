@@ -108,6 +108,8 @@ class TrainingEngine:
         self._forward_hidden: Dict[int, torch.Tensor] = {}
         self._forward_inputs: Dict[int, torch.Tensor] = {}
         self._losses: Dict[int, torch.Tensor] = {}
+        self._pending_activation_recvs: Dict[int, Tuple[torch.Tensor, dist.Work, float]] = {}
+        self._pending_gradient_recvs: Dict[int, Tuple[torch.Tensor, dist.Work, float]] = {}
         self._step_comm_time_sec = 0.0
         self._step_comm_bytes = 0
         self._step_dataloader_wait_sec = 0.0
@@ -161,6 +163,59 @@ class TrainingEngine:
         # Each TP replica group uses tp_idx=0 as the cross-stage transport rank.
         # Other TP ranks receive via intra-stage TP broadcast.
         return self.local_tp_idx == 0
+
+    def _prepost_step_recvs(self, step: int, actions: List) -> None:
+        """
+        Pre-post irecv for this step's planned receives so comm can progress while
+        current micro-batch compute is running. We keep this simple and post one
+        receive per micro-batch action.
+        """
+        if not (self.config.pipeline.overlap_p2p_comm or self._force_async_p2p):
+            return
+        if not self._transport_rank():
+            return
+
+        cfg = self.config.training
+        shape = (cfg.micro_batch_size, cfg.seq_len, cfg.hidden_size)
+        if not self.is_first_stage:
+            src_rank = self.router.prev_peer_rank(self.local_stage_name, self.local_dp_idx)
+            if src_rank is not None:
+                for action in actions:
+                    if action.kind != "F":
+                        continue
+                    mb = action.micro_batch_idx
+                    if mb in self._pending_activation_recvs:
+                        continue
+                    tensor, work = recv_tensor(
+                        shape=shape,
+                        dtype=self.transport_dtype,
+                        device=self.device,
+                        src_rank=src_rank,
+                        tag=activation_tag(step, mb),
+                        async_op=True,
+                    )
+                    if work is not None:
+                        self._pending_activation_recvs[mb] = (tensor, work, time.perf_counter())
+
+        if not self.is_last_stage:
+            src_rank = self.router.next_peer_rank(self.local_stage_name, self.local_dp_idx)
+            if src_rank is not None:
+                for action in actions:
+                    if action.kind != "B":
+                        continue
+                    mb = action.micro_batch_idx
+                    if mb in self._pending_gradient_recvs:
+                        continue
+                    tensor, work = recv_tensor(
+                        shape=shape,
+                        dtype=self.transport_dtype,
+                        device=self.device,
+                        src_rank=src_rank,
+                        tag=gradient_tag(step, mb),
+                        async_op=True,
+                    )
+                    if work is not None:
+                        self._pending_gradient_recvs[mb] = (tensor, work, time.perf_counter())
 
     def _estimate_ddp_sync_bytes_mb(self) -> float:
         if not self.use_ddp:
@@ -221,19 +276,26 @@ class TrainingEngine:
         cfg = self.config.training
         shape = (cfg.micro_batch_size, cfg.seq_len, cfg.hidden_size)
         if self._transport_rank():
-            src_rank = self.router.prev_peer_rank(self.local_stage_name, self.local_dp_idx)
-            if src_rank is None:
-                raise RuntimeError("prev stage is missing for activation recv")
-            t0 = time.perf_counter()
-            tensor, _ = recv_tensor(
-                shape=shape,
-                dtype=self.transport_dtype,
-                device=self.device,
-                src_rank=src_rank,
-                tag=activation_tag(step, micro_batch_idx),
-                async_op=False,
-            )
-            self._record_comm("act_recv", time.perf_counter() - t0, tensor)
+            preposted = self._pending_activation_recvs.pop(micro_batch_idx, None)
+            if preposted is not None:
+                tensor, work, _post_t = preposted
+                t0 = time.perf_counter()
+                work.wait()
+                self._record_comm("act_recv", time.perf_counter() - t0, tensor)
+            else:
+                src_rank = self.router.prev_peer_rank(self.local_stage_name, self.local_dp_idx)
+                if src_rank is None:
+                    raise RuntimeError("prev stage is missing for activation recv")
+                t0 = time.perf_counter()
+                tensor, _ = recv_tensor(
+                    shape=shape,
+                    dtype=self.transport_dtype,
+                    device=self.device,
+                    src_rank=src_rank,
+                    tag=activation_tag(step, micro_batch_idx),
+                    async_op=False,
+                )
+                self._record_comm("act_recv", time.perf_counter() - t0, tensor)
         else:
             tensor = torch.empty(shape, dtype=self.transport_dtype, device=self.device)
         self._tp_broadcast(tensor)
@@ -267,19 +329,26 @@ class TrainingEngine:
         cfg = self.config.training
         shape = (cfg.micro_batch_size, cfg.seq_len, cfg.hidden_size)
         if self._transport_rank():
-            src_rank = self.router.next_peer_rank(self.local_stage_name, self.local_dp_idx)
-            if src_rank is None:
-                raise RuntimeError("next stage is missing for gradient recv")
-            t0 = time.perf_counter()
-            grad, _ = recv_tensor(
-                shape=shape,
-                dtype=self.transport_dtype,
-                device=self.device,
-                src_rank=src_rank,
-                tag=gradient_tag(step, micro_batch_idx),
-                async_op=False,
-            )
-            self._record_comm("grad_recv", time.perf_counter() - t0, grad)
+            preposted = self._pending_gradient_recvs.pop(micro_batch_idx, None)
+            if preposted is not None:
+                grad, work, _post_t = preposted
+                t0 = time.perf_counter()
+                work.wait()
+                self._record_comm("grad_recv", time.perf_counter() - t0, grad)
+            else:
+                src_rank = self.router.next_peer_rank(self.local_stage_name, self.local_dp_idx)
+                if src_rank is None:
+                    raise RuntimeError("next stage is missing for gradient recv")
+                t0 = time.perf_counter()
+                grad, _ = recv_tensor(
+                    shape=shape,
+                    dtype=self.transport_dtype,
+                    device=self.device,
+                    src_rank=src_rank,
+                    tag=gradient_tag(step, micro_batch_idx),
+                    async_op=False,
+                )
+                self._record_comm("grad_recv", time.perf_counter() - t0, grad)
         else:
             grad = torch.empty(shape, dtype=self.transport_dtype, device=self.device)
         self._tp_broadcast(grad)
@@ -441,6 +510,8 @@ class TrainingEngine:
         self._forward_hidden.clear()
         self._forward_inputs.clear()
         self._losses.clear()
+        self._pending_activation_recvs.clear()
+        self._pending_gradient_recvs.clear()
         self._step_comm_time_sec = 0.0
         self._step_comm_bytes = 0
         self._step_dataloader_wait_sec = 0.0
@@ -460,6 +531,7 @@ class TrainingEngine:
             stage_index=self.stage_index,
         )
         actions = scheduler.build()
+        self._prepost_step_recvs(step, actions)
 
         total_loss = 0.0
         forward_time = 0.0
@@ -475,6 +547,8 @@ class TrainingEngine:
                 backward_time += time.perf_counter() - t0
 
         self._wait_pending()
+        self._pending_activation_recvs.clear()
+        self._pending_gradient_recvs.clear()
         comm_mb = float(self._step_comm_bytes) / (1024.0 * 1024.0)
         comm_time = float(self._step_comm_time_sec)
         comm_bw = comm_mb / max(comm_time, 1e-6)
