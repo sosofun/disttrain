@@ -144,24 +144,29 @@ class _BufferBucket:
         *,
         distributed: bool,
         dp_group: Optional[dist.ProcessGroup],
-    ) -> Dict[str, float]:
-        stats = {"time_sec": 0.0, "bytes_mb": 0.0}
+    ) -> Dict[str, object]:
+        stats: Dict[str, object] = {"time_sec": 0.0, "bytes_mb": 0.0, "work": None}
         if self.dp_world_size <= 1 or not distributed:
             self.local_main_grad_shard.copy_(
                 self.main_grad_buffer_padded[self.local_start : self.local_end]
             )
             return stats
 
-        t0 = time.perf_counter()
+        bytes_mb = float(self.padded_numel * 4) / (1024.0 * 1024.0)
+        stats["bytes_mb"] = bytes_mb
         used_fallback = False
+        work = None
         if hasattr(dist, "reduce_scatter_tensor"):
             try:
-                dist.reduce_scatter_tensor(
+                work = dist.reduce_scatter_tensor(
                     output=self.local_main_grad_shard,
                     input=self.main_grad_buffer_padded,
                     op=dist.ReduceOp.SUM,
                     group=dp_group,
+                    async_op=True,
                 )
+                stats["work"] = work
+                return stats
             except Exception:
                 used_fallback = True
         else:
@@ -169,16 +174,26 @@ class _BufferBucket:
         if used_fallback:
             # Compatibility path for older torch builds/backends.
             chunks = list(self.main_grad_buffer_padded.chunk(self.dp_world_size))
-            dist.reduce_scatter(
-                output=self.local_main_grad_shard,
-                input_list=chunks,
-                op=dist.ReduceOp.SUM,
-                group=dp_group,
-            )
-        self.local_main_grad_shard /= float(self.dp_world_size)
-        elapsed = time.perf_counter() - t0
-        stats["time_sec"] += elapsed
-        stats["bytes_mb"] += float(self.padded_numel * 4) / (1024.0 * 1024.0)
+            t0 = time.perf_counter()
+            try:
+                work = dist.reduce_scatter(
+                    output=self.local_main_grad_shard,
+                    input_list=chunks,
+                    op=dist.ReduceOp.SUM,
+                    group=dp_group,
+                    async_op=True,
+                )
+                stats["work"] = work
+                stats["time_sec"] = time.perf_counter() - t0
+                return stats
+            except Exception:
+                dist.reduce_scatter(
+                    output=self.local_main_grad_shard,
+                    input_list=chunks,
+                    op=dist.ReduceOp.SUM,
+                    group=dp_group,
+                )
+                stats["time_sec"] = time.perf_counter() - t0
         return stats
 
     def local_adamw_update(
@@ -216,14 +231,15 @@ class _BufferBucket:
         self,
         *,
         dp_group: Optional[dist.ProcessGroup],
-    ) -> None:
+    ) -> Optional[dist.Work]:
         used_fallback = False
         if hasattr(dist, "all_gather_into_tensor"):
             try:
-                dist.all_gather_into_tensor(
+                return dist.all_gather_into_tensor(
                     output_tensor=self.param_buffer_padded,
                     input_tensor=self.local_param_shard,
                     group=dp_group,
+                    async_op=True,
                 )
             except Exception:
                 used_fallback = True
@@ -232,24 +248,33 @@ class _BufferBucket:
         if used_fallback:
             # Compatibility path for older torch builds/backends.
             gather_chunks = list(self.param_buffer_padded.chunk(self.dp_world_size))
-            dist.all_gather(gather_chunks, self.local_param_shard, group=dp_group)
+            try:
+                return dist.all_gather(
+                    gather_chunks,
+                    self.local_param_shard,
+                    group=dp_group,
+                    async_op=True,
+                )
+            except Exception:
+                dist.all_gather(gather_chunks, self.local_param_shard, group=dp_group)
+        return None
 
     def all_gather_updated_params(
         self,
         *,
         distributed: bool,
         dp_group: Optional[dist.ProcessGroup],
-    ) -> Dict[str, float]:
-        stats = {"time_sec": 0.0, "bytes_mb": 0.0}
+    ) -> Dict[str, object]:
+        stats: Dict[str, object] = {"time_sec": 0.0, "bytes_mb": 0.0, "work": None}
         self.local_param_shard.copy_(self.local_main_param_shard.to(self.dtype))
         if self.dp_world_size <= 1 or not distributed:
             return stats
 
         t0 = time.perf_counter()
-        self._all_gather_param_buffer(dp_group=dp_group)
-        elapsed = time.perf_counter() - t0
-        stats["time_sec"] += elapsed
-        stats["bytes_mb"] += float(self.padded_numel * self.local_param_shard.element_size()) / (
+        work = self._all_gather_param_buffer(dp_group=dp_group)
+        stats["time_sec"] = time.perf_counter() - t0
+        stats["work"] = work
+        stats["bytes_mb"] = float(self.padded_numel * self.local_param_shard.element_size()) / (
             1024.0 * 1024.0
         )
         return stats
@@ -295,7 +320,9 @@ class _BufferBucket:
 
         self.local_param_shard.copy_(self.local_main_param_shard.to(self.dtype))
         if self.dp_world_size > 1 and distributed:
-            self._all_gather_param_buffer(dp_group=dp_group)
+            work = self._all_gather_param_buffer(dp_group=dp_group)
+            if work is not None:
+                work.wait()
 
 
 class Zero1AdamW(Optimizer):
@@ -408,12 +435,31 @@ class Zero1AdamW(Optimizer):
         total_rs_mb = 0.0
         total_ag_time = 0.0
         total_ag_mb = 0.0
+        rs_launched: List[Dict[str, object]] = []
+
         for bucket in self._buckets:
             bucket.copy_model_grads_to_main_buffer()
-            rs_stats = bucket.reduce_scatter_main_grads(
-                distributed=self._distributed,
-                dp_group=self.dp_group,
+            rs_launched.append(
+                bucket.reduce_scatter_main_grads(
+                    distributed=self._distributed,
+                    dp_group=self.dp_group,
+                )
             )
+
+        # Pipeline RS/AG across dtype buckets:
+        # while AG of previous bucket is in flight, execute local update/RS-wait
+        # and AG launch of current bucket to reduce visible communication stalls.
+        pending_ags: List[Tuple[_BufferBucket, Dict[str, object]]] = []
+        for idx, bucket in enumerate(self._buckets):
+            rs_stats = rs_launched[idx]
+            total_rs_mb += float(rs_stats["bytes_mb"])
+            total_rs_time += float(rs_stats["time_sec"])
+            rs_work = rs_stats.get("work")
+            if rs_work is not None:
+                t_wait = time.perf_counter()
+                rs_work.wait()
+                total_rs_time += time.perf_counter() - t_wait
+            bucket.local_main_grad_shard /= float(bucket.dp_world_size)
             bucket.local_adamw_update(
                 lr=lr,
                 beta1=beta1,
@@ -426,11 +472,28 @@ class Zero1AdamW(Optimizer):
                 distributed=self._distributed,
                 dp_group=self.dp_group,
             )
-            bucket.zero_grad_buffers()
-            total_rs_time += float(rs_stats["time_sec"])
-            total_rs_mb += float(rs_stats["bytes_mb"])
-            total_ag_time += float(ag_stats["time_sec"])
             total_ag_mb += float(ag_stats["bytes_mb"])
+            total_ag_time += float(ag_stats["time_sec"])
+            pending_ags.append((bucket, ag_stats))
+
+            # Keep one AG in flight to overlap with next bucket update.
+            if len(pending_ags) > 1:
+                done_bucket, done_ag = pending_ags.pop(0)
+                ag_work = done_ag.get("work")
+                if ag_work is not None:
+                    t_wait = time.perf_counter()
+                    ag_work.wait()
+                    total_ag_time += time.perf_counter() - t_wait
+                done_bucket.zero_grad_buffers()
+
+        # Flush remaining AG work handles.
+        for done_bucket, done_ag in pending_ags:
+            ag_work = done_ag.get("work")
+            if ag_work is not None:
+                t_wait = time.perf_counter()
+                ag_work.wait()
+                total_ag_time += time.perf_counter() - t_wait
+            done_bucket.zero_grad_buffers()
 
         self.last_sync_stats = {
             "time_sec": float(total_rs_time + total_ag_time),
