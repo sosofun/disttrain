@@ -99,6 +99,9 @@ P2P profiling 细粒度字段（用于通信/overlap 诊断）已包含在 JSON 
 - `comm_p2p_prepost_hit_rate`
 - `comm_p2p_recv_overlap_est_sec` / `comm_p2p_recv_overlap_ratio`
 
+> 说明：NCCL 后端下默认关闭“预投递 irecv（pre-post recv）”以提高稳定性，自动回退为按需接收路径；
+> Gloo/CPU 路径仍可使用 pre-post 接收重叠。
+
 或使用脚本（fake 数据）：
 
 ```bash

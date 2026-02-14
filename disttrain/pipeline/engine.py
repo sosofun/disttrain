@@ -116,6 +116,7 @@ class TrainingEngine:
         )
         # 1F1B relies on non-blocking p2p to avoid cross-stage send/recv lockstep deadlocks.
         self._force_async_p2p = self.config.pipeline.schedule == "1f1b"
+        self._allow_prepost_recvs = self._resolve_allow_prepost_recvs()
 
         self._forward_hidden: Dict[int, torch.Tensor] = {}
         self._forward_inputs: Dict[int, torch.Tensor] = {}
@@ -201,6 +202,27 @@ class TrainingEngine:
         # auto mode: use direct TP-to-TP boundary only when tp_size matches.
         return peer_tp == self.local_stage.tp_size and peer_tp > 1
 
+    def _resolve_allow_prepost_recvs(self) -> bool:
+        """
+        NCCL P2P can become fragile when many tagged irecv requests are posted far
+        ahead of actual sends under 1F1B. Keep a conservative default: disable
+        pre-post receive on NCCL and use the stable just-in-time receive path.
+        """
+        if not self._dist_ready():
+            return True
+        try:
+            backend = str(dist.get_backend()).lower()
+        except Exception:
+            backend = ""
+        if backend == "nccl":
+            if self.topology.runtime_rank == 0:
+                print(
+                    "[INFO] disable pre-post irecv on NCCL backend for stability; "
+                    "using just-in-time recv path."
+                )
+            return False
+        return True
+
     def _transport_rank(self) -> bool:
         # Each TP replica group uses tp_idx=0 as the cross-stage transport rank.
         # Other TP ranks receive via intra-stage TP broadcast.
@@ -261,6 +283,8 @@ class TrainingEngine:
         receive per micro-batch action.
         """
         if not (self.config.pipeline.overlap_p2p_comm or self._force_async_p2p):
+            return
+        if not self._allow_prepost_recvs:
             return
 
         cfg = self.config.training
