@@ -175,6 +175,10 @@ python train.py --config configs/text_llm_only_local.yaml --deterministic
 - `distributed.grad_sync_bucket_mb`：梯度 all-reduce bucket 大小（MB，`0` 表示按参数逐个同步）
 - `pipeline.transport_dtype`：跨阶段激活/梯度传输 dtype，支持 `auto/fp32/fp16/bf16`
   - `auto`（默认）：CUDA 下随训练精度选择（bf16/fp16），CPU 下回退 fp32
+- `pipeline.transport_tp_mode`：跨阶段 TP 边界传输模式，支持 `single/auto/direct`
+  - `single`（默认）：仅 `tp_idx=0` rank 做边界通信，阶段内再 TP 广播
+  - `auto`：当相邻阶段 `tp_size` 相等且 `tp_size>1` 时启用 TP-to-TP 直连，否则回退 `single`
+  - `direct`：强制 TP-to-TP 直连（要求所有相邻 enabled stages 的 `tp_size` 相等）
 - `training.deterministic`：是否启用确定性模式（默认 `false`）
   - 开启后会设置 `torch.use_deterministic_algorithms(True)`、`cudnn.deterministic=True`、
     `cudnn.benchmark=False`、关闭 TF32，并设置 `CUBLAS_WORKSPACE_CONFIG=:4096:8`

@@ -10,6 +10,7 @@ STAGE_ORDER = ("encoder", "llm", "decoder")
 VALID_MODALITIES = {"text", "image", "video", "audio"}
 VALID_SCHEDULES = {"gpipe", "1f1b"}
 VALID_TRANSPORT_DTYPES = {"auto", "fp32", "fp16", "bf16"}
+VALID_TRANSPORT_TP_MODES = {"single", "auto", "direct"}
 VALID_LOSS_WEIGHT_KEYS = {"text", "image", "audio"}
 
 
@@ -50,6 +51,7 @@ class PipelineConfig:
     num_micro_batches: int = 8
     overlap_p2p_comm: bool = True
     transport_dtype: str = "auto"
+    transport_tp_mode: str = "single"
 
 
 @dataclass
@@ -143,6 +145,11 @@ class RunConfig:
                 "pipeline.transport_dtype must be one of "
                 f"{sorted(VALID_TRANSPORT_DTYPES)}, got {self.pipeline.transport_dtype}"
             )
+        if self.pipeline.transport_tp_mode not in VALID_TRANSPORT_TP_MODES:
+            raise ConfigError(
+                "pipeline.transport_tp_mode must be one of "
+                f"{sorted(VALID_TRANSPORT_TP_MODES)}, got {self.pipeline.transport_tp_mode}"
+            )
         if self.pipeline.num_micro_batches < 1:
             raise ConfigError("pipeline.num_micro_batches must be >= 1")
         pipeline_depth = len(self.enabled_stages)
@@ -152,6 +159,18 @@ class RunConfig:
                 f"num_micro_batches={self.pipeline.num_micro_batches}, "
                 f"enabled_stage_count={pipeline_depth}"
             )
+        if self.pipeline.transport_tp_mode == "direct":
+            enabled = self.enabled_stages
+            for i in range(len(enabled) - 1):
+                lhs = enabled[i]
+                rhs = enabled[i + 1]
+                lhs_tp = self.stages[lhs].tp_size
+                rhs_tp = self.stages[rhs].tp_size
+                if lhs_tp != rhs_tp:
+                    raise ConfigError(
+                        "pipeline.transport_tp_mode=direct requires equal adjacent stage tp_size, "
+                        f"got stages.{lhs}.tp_size={lhs_tp}, stages.{rhs}.tp_size={rhs_tp}"
+                    )
 
         if self.distributed.world_size in (0, None):
             self.distributed.world_size = self.expected_world_size
@@ -261,6 +280,7 @@ class RunConfig:
             num_micro_batches=int(pipeline_raw.get("num_micro_batches", 8)),
             overlap_p2p_comm=bool(pipeline_raw.get("overlap_p2p_comm", True)),
             transport_dtype=str(pipeline_raw.get("transport_dtype", "auto")).lower(),
+            transport_tp_mode=str(pipeline_raw.get("transport_tp_mode", "single")).lower(),
         )
         optimizer_raw = training_raw.get("optimizer", {})
         io_raw = training_raw.get("io", {})

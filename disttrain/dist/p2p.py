@@ -39,6 +39,16 @@ class P2PRouter:
         next_dp = dp_idx % next_dp_size
         return self.topology.rank_for(next_stage, next_dp, 0)
 
+    def next_peer_rank_tp(self, stage_name: str, dp_idx: int, tp_idx: int) -> Optional[int]:
+        next_stage = self.topology.next_stage(stage_name)
+        if next_stage is None:
+            return None
+        next_dp_size = self.topology.stages[next_stage].dp_size
+        next_tp_size = self.topology.stages[next_stage].tp_size
+        next_dp = dp_idx % next_dp_size
+        next_tp = tp_idx % next_tp_size
+        return self.topology.rank_for(next_stage, next_dp, next_tp)
+
     def prev_peer_rank(self, stage_name: str, dp_idx: int) -> Optional[int]:
         prev_stage = self.topology.prev_stage(stage_name)
         if prev_stage is None:
@@ -46,6 +56,16 @@ class P2PRouter:
         prev_dp_size = self.topology.stages[prev_stage].dp_size
         prev_dp = dp_idx % prev_dp_size
         return self.topology.rank_for(prev_stage, prev_dp, 0)
+
+    def prev_peer_rank_tp(self, stage_name: str, dp_idx: int, tp_idx: int) -> Optional[int]:
+        prev_stage = self.topology.prev_stage(stage_name)
+        if prev_stage is None:
+            return None
+        prev_dp_size = self.topology.stages[prev_stage].dp_size
+        prev_tp_size = self.topology.stages[prev_stage].tp_size
+        prev_dp = dp_idx % prev_dp_size
+        prev_tp = tp_idx % prev_tp_size
+        return self.topology.rank_for(prev_stage, prev_dp, prev_tp)
 
     def route_to_next(self, stage_name: str, dp_idx: int) -> Optional[PeerRoute]:
         next_stage = self.topology.next_stage(stage_name)

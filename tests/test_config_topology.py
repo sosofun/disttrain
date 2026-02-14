@@ -343,6 +343,60 @@ class ConfigTopologyTests(unittest.TestCase):
         with self.assertRaises(ConfigError):
             RunConfig.from_dict(raw)
 
+    def test_transport_tp_mode_parse(self) -> None:
+        raw = {
+            "distributed": {"world_size": 2, "backend": "gloo"},
+            "stages": {
+                "encoder": {"enabled": True, "tp_size": 1, "dp_size": 1, "model_cls": "EncoderModel"},
+                "llm": {"enabled": True, "tp_size": 1, "dp_size": 1, "model_cls": "LLMModel"},
+                "decoder": {"enabled": False},
+            },
+            "pipeline": {
+                "schedule": "gpipe",
+                "num_micro_batches": 2,
+                "transport_tp_mode": "auto",
+            },
+            "training": {"micro_batch_size": 2, "hidden_size": 64, "seq_len": 16},
+        }
+        cfg = RunConfig.from_dict(raw)
+        self.assertEqual(cfg.pipeline.transport_tp_mode, "auto")
+
+    def test_transport_tp_mode_direct_requires_equal_adjacent_tp(self) -> None:
+        raw = {
+            "distributed": {"world_size": 3, "backend": "gloo"},
+            "stages": {
+                "encoder": {"enabled": True, "tp_size": 1, "dp_size": 1, "model_cls": "EncoderModel"},
+                "llm": {"enabled": True, "tp_size": 2, "dp_size": 1, "model_cls": "LLMModel"},
+                "decoder": {"enabled": False},
+            },
+            "pipeline": {
+                "schedule": "gpipe",
+                "num_micro_batches": 2,
+                "transport_tp_mode": "direct",
+            },
+            "training": {"micro_batch_size": 2, "hidden_size": 64, "seq_len": 16},
+        }
+        with self.assertRaises(ConfigError):
+            RunConfig.from_dict(raw)
+
+    def test_transport_tp_mode_validation(self) -> None:
+        raw = {
+            "distributed": {"world_size": 1, "backend": "gloo"},
+            "stages": {
+                "encoder": {"enabled": False},
+                "llm": {"enabled": True, "tp_size": 1, "dp_size": 1, "model_cls": "LLMModel"},
+                "decoder": {"enabled": False},
+            },
+            "pipeline": {
+                "schedule": "gpipe",
+                "num_micro_batches": 2,
+                "transport_tp_mode": "invalid",
+            },
+            "training": {"micro_batch_size": 2, "hidden_size": 64, "seq_len": 16},
+        }
+        with self.assertRaises(ConfigError):
+            RunConfig.from_dict(raw)
+
 
 if __name__ == "__main__":
     unittest.main()

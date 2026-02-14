@@ -97,6 +97,8 @@ class TrainingEngine:
         else:
             self.autocast_dtype = torch.float32
         self.transport_dtype = self._resolve_transport_dtype()
+        self._direct_prev_boundary = self._resolve_direct_prev_boundary()
+        self._direct_next_boundary = self._resolve_direct_next_boundary()
 
         self.bubble_ratio = theoretical_bubble_ratio(
             pipeline_depth=self.pipeline_depth,
@@ -159,10 +161,80 @@ class TrainingEngine:
             return torch.float32
         return chosen
 
+    def _resolve_direct_prev_boundary(self) -> bool:
+        prev_stage = self.topology.prev_stage(self.local_stage_name)
+        return self._resolve_direct_boundary(peer_stage=prev_stage)
+
+    def _resolve_direct_next_boundary(self) -> bool:
+        next_stage = self.topology.next_stage(self.local_stage_name)
+        return self._resolve_direct_boundary(peer_stage=next_stage)
+
+    def _resolve_direct_boundary(self, peer_stage: Optional[str]) -> bool:
+        if peer_stage is None:
+            return False
+        mode = self.config.pipeline.transport_tp_mode
+        if mode == "single":
+            return False
+        if self.local_stage.tp_size <= 1:
+            return False
+        peer_tp = self.topology.stages[peer_stage].tp_size
+        if mode == "direct":
+            return True
+        # auto mode: use direct TP-to-TP boundary only when tp_size matches.
+        return peer_tp == self.local_stage.tp_size and peer_tp > 1
+
     def _transport_rank(self) -> bool:
         # Each TP replica group uses tp_idx=0 as the cross-stage transport rank.
         # Other TP ranks receive via intra-stage TP broadcast.
         return self.local_tp_idx == 0
+
+    def _recv_activation_on_this_rank(self) -> bool:
+        return self._direct_prev_boundary or self._transport_rank()
+
+    def _send_activation_on_this_rank(self) -> bool:
+        return self._direct_next_boundary or self._transport_rank()
+
+    def _recv_gradient_on_this_rank(self) -> bool:
+        return self._direct_next_boundary or self._transport_rank()
+
+    def _send_gradient_on_this_rank(self) -> bool:
+        return self._direct_prev_boundary or self._transport_rank()
+
+    def _activation_src_rank(self) -> Optional[int]:
+        if self._direct_prev_boundary:
+            return self.router.prev_peer_rank_tp(
+                self.local_stage_name,
+                self.local_dp_idx,
+                self.local_tp_idx,
+            )
+        return self.router.prev_peer_rank(self.local_stage_name, self.local_dp_idx)
+
+    def _activation_dst_rank(self) -> Optional[int]:
+        if self._direct_next_boundary:
+            return self.router.next_peer_rank_tp(
+                self.local_stage_name,
+                self.local_dp_idx,
+                self.local_tp_idx,
+            )
+        return self.router.next_peer_rank(self.local_stage_name, self.local_dp_idx)
+
+    def _gradient_src_rank(self) -> Optional[int]:
+        if self._direct_next_boundary:
+            return self.router.next_peer_rank_tp(
+                self.local_stage_name,
+                self.local_dp_idx,
+                self.local_tp_idx,
+            )
+        return self.router.next_peer_rank(self.local_stage_name, self.local_dp_idx)
+
+    def _gradient_dst_rank(self) -> Optional[int]:
+        if self._direct_prev_boundary:
+            return self.router.prev_peer_rank_tp(
+                self.local_stage_name,
+                self.local_dp_idx,
+                self.local_tp_idx,
+            )
+        return self.router.prev_peer_rank(self.local_stage_name, self.local_dp_idx)
 
     def _prepost_step_recvs(self, step: int, actions: List) -> None:
         """
@@ -172,13 +244,11 @@ class TrainingEngine:
         """
         if not (self.config.pipeline.overlap_p2p_comm or self._force_async_p2p):
             return
-        if not self._transport_rank():
-            return
 
         cfg = self.config.training
         shape = (cfg.micro_batch_size, cfg.seq_len, cfg.hidden_size)
-        if not self.is_first_stage:
-            src_rank = self.router.prev_peer_rank(self.local_stage_name, self.local_dp_idx)
+        if not self.is_first_stage and self._recv_activation_on_this_rank():
+            src_rank = self._activation_src_rank()
             if src_rank is not None:
                 for action in actions:
                     if action.kind != "F":
@@ -197,8 +267,8 @@ class TrainingEngine:
                     if work is not None:
                         self._pending_activation_recvs[mb] = (tensor, work, time.perf_counter())
 
-        if not self.is_last_stage:
-            src_rank = self.router.next_peer_rank(self.local_stage_name, self.local_dp_idx)
+        if not self.is_last_stage and self._recv_gradient_on_this_rank():
+            src_rank = self._gradient_src_rank()
             if src_rank is not None:
                 for action in actions:
                     if action.kind != "B":
@@ -275,7 +345,7 @@ class TrainingEngine:
     def _recv_activation(self, step: int, micro_batch_idx: int) -> torch.Tensor:
         cfg = self.config.training
         shape = (cfg.micro_batch_size, cfg.seq_len, cfg.hidden_size)
-        if self._transport_rank():
+        if self._recv_activation_on_this_rank():
             preposted = self._pending_activation_recvs.pop(micro_batch_idx, None)
             if preposted is not None:
                 tensor, work, _post_t = preposted
@@ -283,7 +353,7 @@ class TrainingEngine:
                 work.wait()
                 self._record_comm("act_recv", time.perf_counter() - t0, tensor)
             else:
-                src_rank = self.router.prev_peer_rank(self.local_stage_name, self.local_dp_idx)
+                src_rank = self._activation_src_rank()
                 if src_rank is None:
                     raise RuntimeError("prev stage is missing for activation recv")
                 t0 = time.perf_counter()
@@ -298,16 +368,17 @@ class TrainingEngine:
                 self._record_comm("act_recv", time.perf_counter() - t0, tensor)
         else:
             tensor = torch.empty(shape, dtype=self.transport_dtype, device=self.device)
-        self._tp_broadcast(tensor)
+        if not self._direct_prev_boundary:
+            self._tp_broadcast(tensor)
         if tensor.dtype != torch.float32:
             tensor = tensor.to(dtype=torch.float32)
         tensor.requires_grad_(True)
         return tensor
 
     def _send_activation(self, hidden: torch.Tensor, step: int, micro_batch_idx: int) -> None:
-        if not self._transport_rank():
+        if not self._send_activation_on_this_rank():
             return
-        dst_rank = self.router.next_peer_rank(self.local_stage_name, self.local_dp_idx)
+        dst_rank = self._activation_dst_rank()
         if dst_rank is None:
             raise RuntimeError("next stage is missing for activation send")
         use_async = self.config.pipeline.overlap_p2p_comm or self._force_async_p2p
@@ -328,7 +399,7 @@ class TrainingEngine:
     def _recv_gradient(self, step: int, micro_batch_idx: int) -> torch.Tensor:
         cfg = self.config.training
         shape = (cfg.micro_batch_size, cfg.seq_len, cfg.hidden_size)
-        if self._transport_rank():
+        if self._recv_gradient_on_this_rank():
             preposted = self._pending_gradient_recvs.pop(micro_batch_idx, None)
             if preposted is not None:
                 grad, work, _post_t = preposted
@@ -336,7 +407,7 @@ class TrainingEngine:
                 work.wait()
                 self._record_comm("grad_recv", time.perf_counter() - t0, grad)
             else:
-                src_rank = self.router.next_peer_rank(self.local_stage_name, self.local_dp_idx)
+                src_rank = self._gradient_src_rank()
                 if src_rank is None:
                     raise RuntimeError("next stage is missing for gradient recv")
                 t0 = time.perf_counter()
@@ -351,7 +422,8 @@ class TrainingEngine:
                 self._record_comm("grad_recv", time.perf_counter() - t0, grad)
         else:
             grad = torch.empty(shape, dtype=self.transport_dtype, device=self.device)
-        self._tp_broadcast(grad)
+        if not self._direct_next_boundary:
+            self._tp_broadcast(grad)
         if grad.dtype != torch.float32:
             grad = grad.to(dtype=torch.float32)
         return grad
@@ -363,10 +435,10 @@ class TrainingEngine:
                 dist.all_reduce(grad, op=dist.ReduceOp.SUM, group=tp_group)
                 grad /= float(self.local_stage.tp_size)
 
-        if not self._transport_rank():
+        if not self._send_gradient_on_this_rank():
             return
 
-        dst_rank = self.router.prev_peer_rank(self.local_stage_name, self.local_dp_idx)
+        dst_rank = self._gradient_dst_rank()
         if dst_rank is None:
             raise RuntimeError("prev stage is missing for gradient send")
         use_async = self.config.pipeline.overlap_p2p_comm or self._force_async_p2p
