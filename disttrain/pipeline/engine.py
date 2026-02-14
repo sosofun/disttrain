@@ -47,6 +47,16 @@ class StepMetrics:
     comm_gradient_send_sec: float
     comm_gradient_recv_sec: float
     comm_wait_sec: float
+    comm_p2p_send_launch_sec: float
+    comm_p2p_recv_launch_sec: float
+    comm_p2p_recv_wait_sec: float
+    comm_p2p_send_wait_sec: float
+    comm_p2p_prepost_posted: int
+    comm_p2p_prepost_hits: int
+    comm_p2p_prepost_misses: int
+    comm_p2p_prepost_hit_rate: float
+    comm_p2p_recv_overlap_est_sec: float
+    comm_p2p_recv_overlap_ratio: float
     gpu_mem_peak_mb: float
     grad_norm: Optional[float]
     lr: float
@@ -123,6 +133,7 @@ class TrainingEngine:
             "grad_recv": 0.0,
             "wait": 0.0,
         }
+        self._step_p2p_profile = self._new_p2p_profile()
         self.source_provider: Optional[FakeBatchProvider] = None
         if self.is_first_stage:
             self.source_provider = FakeBatchProvider(
@@ -256,6 +267,7 @@ class TrainingEngine:
                     mb = action.micro_batch_idx
                     if mb in self._pending_activation_recvs:
                         continue
+                    t_launch = time.perf_counter()
                     tensor, work = recv_tensor(
                         shape=shape,
                         dtype=self.transport_dtype,
@@ -264,7 +276,9 @@ class TrainingEngine:
                         tag=activation_tag(step, mb),
                         async_op=True,
                     )
+                    self._step_p2p_profile["act_recv_launch_sec"] += time.perf_counter() - t_launch
                     if work is not None:
+                        self._step_p2p_profile["prepost_posted"] += 1.0
                         self._pending_activation_recvs[mb] = (tensor, work, time.perf_counter())
 
         if not self.is_last_stage and self._recv_gradient_on_this_rank():
@@ -276,6 +290,7 @@ class TrainingEngine:
                     mb = action.micro_batch_idx
                     if mb in self._pending_gradient_recvs:
                         continue
+                    t_launch = time.perf_counter()
                     tensor, work = recv_tensor(
                         shape=shape,
                         dtype=self.transport_dtype,
@@ -284,7 +299,9 @@ class TrainingEngine:
                         tag=gradient_tag(step, mb),
                         async_op=True,
                     )
+                    self._step_p2p_profile["grad_recv_launch_sec"] += time.perf_counter() - t_launch
                     if work is not None:
+                        self._step_p2p_profile["prepost_posted"] += 1.0
                         self._pending_gradient_recvs[mb] = (tensor, work, time.perf_counter())
 
     def _estimate_ddp_sync_bytes_mb(self) -> float:
@@ -304,6 +321,24 @@ class TrainingEngine:
         self._step_comm_bytes += tensor.numel() * tensor.element_size()
         if channel in self._step_comm_breakdown:
             self._step_comm_breakdown[channel] += elapsed_sec
+
+    def _new_p2p_profile(self) -> Dict[str, float]:
+        return {
+            "act_send_launch_sec": 0.0,
+            "grad_send_launch_sec": 0.0,
+            "act_recv_launch_sec": 0.0,
+            "grad_recv_launch_sec": 0.0,
+            "act_recv_wait_sec": 0.0,
+            "grad_recv_wait_sec": 0.0,
+            "send_wait_sec": 0.0,
+            "prepost_posted": 0.0,
+            "act_prepost_hit": 0.0,
+            "grad_prepost_hit": 0.0,
+            "act_prepost_miss": 0.0,
+            "grad_prepost_miss": 0.0,
+            # Heuristic overlap: time between irecv post and wait start.
+            "recv_overlap_est_sec": 0.0,
+        }
 
     def _tp_broadcast(self, tensor: torch.Tensor) -> torch.Tensor:
         if not self._dist_ready() or self.local_stage.tp_size == 1:
@@ -348,14 +383,19 @@ class TrainingEngine:
         if self._recv_activation_on_this_rank():
             preposted = self._pending_activation_recvs.pop(micro_batch_idx, None)
             if preposted is not None:
-                tensor, work, _post_t = preposted
-                t0 = time.perf_counter()
+                tensor, work, post_t = preposted
+                wait_start = time.perf_counter()
                 work.wait()
-                self._record_comm("act_recv", time.perf_counter() - t0, tensor)
+                waited = time.perf_counter() - wait_start
+                self._step_p2p_profile["act_prepost_hit"] += 1.0
+                self._step_p2p_profile["act_recv_wait_sec"] += waited
+                self._step_p2p_profile["recv_overlap_est_sec"] += max(wait_start - post_t, 0.0)
+                self._record_comm("act_recv", waited, tensor)
             else:
                 src_rank = self._activation_src_rank()
                 if src_rank is None:
                     raise RuntimeError("prev stage is missing for activation recv")
+                self._step_p2p_profile["act_prepost_miss"] += 1.0
                 t0 = time.perf_counter()
                 tensor, _ = recv_tensor(
                     shape=shape,
@@ -365,7 +405,9 @@ class TrainingEngine:
                     tag=activation_tag(step, micro_batch_idx),
                     async_op=False,
                 )
-                self._record_comm("act_recv", time.perf_counter() - t0, tensor)
+                waited = time.perf_counter() - t0
+                self._step_p2p_profile["act_recv_wait_sec"] += waited
+                self._record_comm("act_recv", waited, tensor)
         else:
             tensor = torch.empty(shape, dtype=self.transport_dtype, device=self.device)
         if not self._direct_prev_boundary:
@@ -392,7 +434,9 @@ class TrainingEngine:
             tag=activation_tag(step, micro_batch_idx),
             async_op=use_async,
         )
-        self._record_comm("act_send", time.perf_counter() - t0, payload)
+        launched = time.perf_counter() - t0
+        self._step_p2p_profile["act_send_launch_sec"] += launched
+        self._record_comm("act_send", launched, payload)
         if work is not None:
             self.pending_works.append(work)
 
@@ -402,14 +446,19 @@ class TrainingEngine:
         if self._recv_gradient_on_this_rank():
             preposted = self._pending_gradient_recvs.pop(micro_batch_idx, None)
             if preposted is not None:
-                grad, work, _post_t = preposted
-                t0 = time.perf_counter()
+                grad, work, post_t = preposted
+                wait_start = time.perf_counter()
                 work.wait()
-                self._record_comm("grad_recv", time.perf_counter() - t0, grad)
+                waited = time.perf_counter() - wait_start
+                self._step_p2p_profile["grad_prepost_hit"] += 1.0
+                self._step_p2p_profile["grad_recv_wait_sec"] += waited
+                self._step_p2p_profile["recv_overlap_est_sec"] += max(wait_start - post_t, 0.0)
+                self._record_comm("grad_recv", waited, grad)
             else:
                 src_rank = self._gradient_src_rank()
                 if src_rank is None:
                     raise RuntimeError("next stage is missing for gradient recv")
+                self._step_p2p_profile["grad_prepost_miss"] += 1.0
                 t0 = time.perf_counter()
                 grad, _ = recv_tensor(
                     shape=shape,
@@ -419,7 +468,9 @@ class TrainingEngine:
                     tag=gradient_tag(step, micro_batch_idx),
                     async_op=False,
                 )
-                self._record_comm("grad_recv", time.perf_counter() - t0, grad)
+                waited = time.perf_counter() - t0
+                self._step_p2p_profile["grad_recv_wait_sec"] += waited
+                self._record_comm("grad_recv", waited, grad)
         else:
             grad = torch.empty(shape, dtype=self.transport_dtype, device=self.device)
         if not self._direct_next_boundary:
@@ -452,7 +503,9 @@ class TrainingEngine:
             tag=gradient_tag(step, micro_batch_idx),
             async_op=use_async,
         )
-        self._record_comm("grad_send", time.perf_counter() - t0, payload)
+        launched = time.perf_counter() - t0
+        self._step_p2p_profile["grad_send_launch_sec"] += launched
+        self._record_comm("grad_send", launched, payload)
         if work is not None:
             self.pending_works.append(work)
 
@@ -576,6 +629,7 @@ class TrainingEngine:
             waited = time.perf_counter() - t0
             self._step_comm_time_sec += waited
             self._step_comm_breakdown["wait"] += waited
+            self._step_p2p_profile["send_wait_sec"] += waited
         self.pending_works.clear()
 
     def _run_pipeline_step(self, step: int) -> Dict[str, float]:
@@ -595,6 +649,7 @@ class TrainingEngine:
             "grad_recv": 0.0,
             "wait": 0.0,
         }
+        self._step_p2p_profile = self._new_p2p_profile()
 
         scheduler = PipelineScheduler(
             schedule=self.config.pipeline.schedule,
@@ -624,6 +679,35 @@ class TrainingEngine:
         comm_mb = float(self._step_comm_bytes) / (1024.0 * 1024.0)
         comm_time = float(self._step_comm_time_sec)
         comm_bw = comm_mb / max(comm_time, 1e-6)
+        p2p_send_launch = float(
+            self._step_p2p_profile["act_send_launch_sec"]
+            + self._step_p2p_profile["grad_send_launch_sec"]
+        )
+        p2p_recv_launch = float(
+            self._step_p2p_profile["act_recv_launch_sec"]
+            + self._step_p2p_profile["grad_recv_launch_sec"]
+        )
+        p2p_recv_wait = float(
+            self._step_p2p_profile["act_recv_wait_sec"]
+            + self._step_p2p_profile["grad_recv_wait_sec"]
+        )
+        p2p_send_wait = float(self._step_p2p_profile["send_wait_sec"])
+        p2p_prepost_posted = int(self._step_p2p_profile["prepost_posted"])
+        p2p_prepost_hits = int(
+            self._step_p2p_profile["act_prepost_hit"] + self._step_p2p_profile["grad_prepost_hit"]
+        )
+        p2p_prepost_misses = int(
+            self._step_p2p_profile["act_prepost_miss"] + self._step_p2p_profile["grad_prepost_miss"]
+        )
+        prepost_total = p2p_prepost_hits + p2p_prepost_misses
+        p2p_prepost_hit_rate = (
+            float(p2p_prepost_hits) / float(prepost_total) if prepost_total > 0 else 0.0
+        )
+        p2p_recv_overlap_est = float(self._step_p2p_profile["recv_overlap_est_sec"])
+        p2p_recv_overlap_ratio = p2p_recv_overlap_est / max(
+            p2p_recv_overlap_est + p2p_recv_wait,
+            1e-12,
+        )
         return {
             "loss": total_loss / max(self.config.pipeline.num_micro_batches, 1),
             "forward_time": forward_time,
@@ -636,6 +720,16 @@ class TrainingEngine:
             "comm_grad_send": self._step_comm_breakdown["grad_send"],
             "comm_grad_recv": self._step_comm_breakdown["grad_recv"],
             "comm_wait": self._step_comm_breakdown["wait"],
+            "p2p_send_launch": p2p_send_launch,
+            "p2p_recv_launch": p2p_recv_launch,
+            "p2p_recv_wait": p2p_recv_wait,
+            "p2p_send_wait": p2p_send_wait,
+            "p2p_prepost_posted": p2p_prepost_posted,
+            "p2p_prepost_hits": p2p_prepost_hits,
+            "p2p_prepost_misses": p2p_prepost_misses,
+            "p2p_prepost_hit_rate": p2p_prepost_hit_rate,
+            "p2p_recv_overlap_est": p2p_recv_overlap_est,
+            "p2p_recv_overlap_ratio": p2p_recv_overlap_ratio,
             "dataloader_wait": self._step_dataloader_wait_sec,
             "host_to_device": self._step_h2d_sec,
         }
@@ -785,6 +879,16 @@ class TrainingEngine:
                     comm_gradient_send_sec=float(out["comm_grad_send"]),
                     comm_gradient_recv_sec=float(out["comm_grad_recv"]),
                     comm_wait_sec=float(out["comm_wait"]),
+                    comm_p2p_send_launch_sec=float(out["p2p_send_launch"]),
+                    comm_p2p_recv_launch_sec=float(out["p2p_recv_launch"]),
+                    comm_p2p_recv_wait_sec=float(out["p2p_recv_wait"]),
+                    comm_p2p_send_wait_sec=float(out["p2p_send_wait"]),
+                    comm_p2p_prepost_posted=int(out["p2p_prepost_posted"]),
+                    comm_p2p_prepost_hits=int(out["p2p_prepost_hits"]),
+                    comm_p2p_prepost_misses=int(out["p2p_prepost_misses"]),
+                    comm_p2p_prepost_hit_rate=float(out["p2p_prepost_hit_rate"]),
+                    comm_p2p_recv_overlap_est_sec=float(out["p2p_recv_overlap_est"]),
+                    comm_p2p_recv_overlap_ratio=float(out["p2p_recv_overlap_ratio"]),
                     gpu_mem_peak_mb=gpu_mem_peak_mb,
                     grad_norm=grad_norm_value,
                     lr=float(self.optimizer.param_groups[0].get("lr", 0.0)),

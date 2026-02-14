@@ -299,6 +299,16 @@ def main() -> int:
                 "comm_gradient_send_sec": m.comm_gradient_send_sec,
                 "comm_gradient_recv_sec": m.comm_gradient_recv_sec,
                 "comm_wait_sec": m.comm_wait_sec,
+                "comm_p2p_send_launch_sec": m.comm_p2p_send_launch_sec,
+                "comm_p2p_recv_launch_sec": m.comm_p2p_recv_launch_sec,
+                "comm_p2p_recv_wait_sec": m.comm_p2p_recv_wait_sec,
+                "comm_p2p_send_wait_sec": m.comm_p2p_send_wait_sec,
+                "comm_p2p_prepost_posted": m.comm_p2p_prepost_posted,
+                "comm_p2p_prepost_hits": m.comm_p2p_prepost_hits,
+                "comm_p2p_prepost_misses": m.comm_p2p_prepost_misses,
+                "comm_p2p_prepost_hit_rate": m.comm_p2p_prepost_hit_rate,
+                "comm_p2p_recv_overlap_est_sec": m.comm_p2p_recv_overlap_est_sec,
+                "comm_p2p_recv_overlap_ratio": m.comm_p2p_recv_overlap_ratio,
                 "gpu_mem_peak_mb": m.gpu_mem_peak_mb,
                 "grad_norm": m.grad_norm,
                 "lr": m.lr,
@@ -314,6 +324,7 @@ def main() -> int:
                     "tokens/s={:.1f} samples/s={:.1f} comm={:.3f}s "
                     "io(wait={:.3f},h2d={:.3f}) "
                     "(allr={:.3f},act_s={:.3f},act_r={:.3f},grad_s={:.3f},grad_r={:.3f},wait={:.3f}) "
+                    "p2p(hit={:.2f},ovlp={:.2f},recv_wait={:.3f},send_wait={:.3f}) "
                     "bw={:.2f}MB/s grad_norm={} lr={:.6g} scaler={} sync={} bubble={:.4f} optimizer_step={}".format(
                         payload["step"],
                         m.loss,
@@ -331,6 +342,10 @@ def main() -> int:
                         m.comm_gradient_send_sec,
                         m.comm_gradient_recv_sec,
                         m.comm_wait_sec,
+                        m.comm_p2p_prepost_hit_rate,
+                        m.comm_p2p_recv_overlap_ratio,
+                        m.comm_p2p_recv_wait_sec,
+                        m.comm_p2p_send_wait_sec,
                         m.comm_bandwidth_mb_s,
                         "n/a" if m.grad_norm is None else f"{m.grad_norm:.4f}",
                         m.lr,

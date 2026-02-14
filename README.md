@@ -48,6 +48,13 @@ python train.py --config configs/text_llm_only_local.yaml --max-steps 2 \
   --log-format json --log-file artifacts/train_metrics.jsonl
 ```
 
+P2P profiling 细粒度字段（用于通信/overlap 诊断）已包含在 JSON 指标中：
+- `comm_p2p_send_launch_sec` / `comm_p2p_recv_launch_sec`
+- `comm_p2p_recv_wait_sec` / `comm_p2p_send_wait_sec`
+- `comm_p2p_prepost_posted` / `comm_p2p_prepost_hits` / `comm_p2p_prepost_misses`
+- `comm_p2p_prepost_hit_rate`
+- `comm_p2p_recv_overlap_est_sec` / `comm_p2p_recv_overlap_ratio`
+
 或使用脚本（fake 数据）：
 
 ```bash
