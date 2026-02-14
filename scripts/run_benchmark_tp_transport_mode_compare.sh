@@ -42,11 +42,23 @@ cfg = yaml.safe_load(base.read_text(encoding="utf-8"))
 cfg_single = copy.deepcopy(cfg)
 cfg_single.setdefault("pipeline", {})
 cfg_single["pipeline"]["transport_tp_mode"] = "single"
+cfg_single.setdefault("training", {})
+cfg_single["training"].setdefault("metrics", {})
+cfg_single["training"]["metrics"].setdefault("groups", {})
+cfg_single["training"]["metrics"]["groups"].setdefault("p2p_detail", {})
+cfg_single["training"]["metrics"]["groups"]["p2p_detail"]["enabled"] = True
+cfg_single["training"]["metrics"]["groups"]["p2p_detail"]["every_n_steps"] = 1
 single_cfg.write_text(yaml.safe_dump(cfg_single, sort_keys=False), encoding="utf-8")
 
 cfg_auto = copy.deepcopy(cfg)
 cfg_auto.setdefault("pipeline", {})
 cfg_auto["pipeline"]["transport_tp_mode"] = "auto"
+cfg_auto.setdefault("training", {})
+cfg_auto["training"].setdefault("metrics", {})
+cfg_auto["training"]["metrics"].setdefault("groups", {})
+cfg_auto["training"]["metrics"]["groups"].setdefault("p2p_detail", {})
+cfg_auto["training"]["metrics"]["groups"]["p2p_detail"]["enabled"] = True
+cfg_auto["training"]["metrics"]["groups"]["p2p_detail"]["every_n_steps"] = 1
 auto_cfg.write_text(yaml.safe_dump(cfg_auto, sort_keys=False), encoding="utf-8")
 PY
 

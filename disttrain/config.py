@@ -12,6 +12,8 @@ VALID_SCHEDULES = {"gpipe", "1f1b"}
 VALID_TRANSPORT_DTYPES = {"auto", "fp32", "fp16", "bf16"}
 VALID_TRANSPORT_TP_MODES = {"single", "auto", "direct"}
 VALID_LOSS_WEIGHT_KEYS = {"text", "image", "audio"}
+VALID_METRIC_LEVELS = {"off", "minimal", "standard", "detailed", "debug"}
+VALID_METRIC_RANK_SCOPES = {"auto", "rank0", "sink", "all"}
 
 
 class ConfigError(ValueError):
@@ -65,6 +67,32 @@ class OptimizerConfig:
 
 
 @dataclass
+class MetricGroupConfig:
+    enabled: bool = True
+    every_n_steps: int = 1
+
+
+@dataclass
+class MetricsGroupsConfig:
+    core: MetricGroupConfig = field(default_factory=MetricGroupConfig)
+    throughput: MetricGroupConfig = field(default_factory=MetricGroupConfig)
+    comm_summary: MetricGroupConfig = field(default_factory=MetricGroupConfig)
+    p2p_detail: MetricGroupConfig = field(default_factory=MetricGroupConfig)
+    io: MetricGroupConfig = field(default_factory=MetricGroupConfig)
+    memory: MetricGroupConfig = field(default_factory=MetricGroupConfig)
+
+
+@dataclass
+class MetricsConfig:
+    level: str = "standard"
+    rank_scope: str = "auto"
+    log_every_steps: int = 1
+    groups: MetricsGroupsConfig = field(
+        default_factory=lambda: _default_metrics_groups("standard")
+    )
+
+
+@dataclass
 class TrainingConfig:
     global_batch_size: int = 256
     micro_batch_size: int = 4
@@ -87,6 +115,7 @@ class TrainingConfig:
     )
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
     io: "IOConfig" = field(default_factory=lambda: IOConfig())
+    metrics: "MetricsConfig" = field(default_factory=lambda: _default_metrics_config())
 
 
 @dataclass
@@ -212,6 +241,33 @@ class RunConfig:
             raise ConfigError("training.io.prefetch_size must be >= 0")
         if self.training.io.num_workers < 0:
             raise ConfigError("training.io.num_workers must be >= 0")
+        if self.training.metrics.level not in VALID_METRIC_LEVELS:
+            raise ConfigError(
+                "training.metrics.level must be one of "
+                f"{sorted(VALID_METRIC_LEVELS)}, got {self.training.metrics.level}"
+            )
+        if self.training.metrics.rank_scope not in VALID_METRIC_RANK_SCOPES:
+            raise ConfigError(
+                "training.metrics.rank_scope must be one of "
+                f"{sorted(VALID_METRIC_RANK_SCOPES)}, got {self.training.metrics.rank_scope}"
+            )
+        if self.training.metrics.log_every_steps < 1:
+            raise ConfigError("training.metrics.log_every_steps must be >= 1")
+        metric_groups = self.training.metrics.groups
+        for group_name in (
+            "core",
+            "throughput",
+            "comm_summary",
+            "p2p_detail",
+            "io",
+            "memory",
+        ):
+            group = getattr(metric_groups, group_name)
+            if group.every_n_steps < 1:
+                raise ConfigError(
+                    f"training.metrics.groups.{group_name}.every_n_steps must be >= 1, "
+                    f"got {group.every_n_steps}"
+                )
         if not self.training.loss_weights:
             raise ConfigError("training.loss_weights cannot be empty")
         total_loss_weight = 0.0
@@ -284,6 +340,9 @@ class RunConfig:
         )
         optimizer_raw = training_raw.get("optimizer", {})
         io_raw = training_raw.get("io", {})
+        metrics_raw = training_raw.get("metrics", {})
+        if metrics_raw is None:
+            metrics_raw = {}
         loss_weights_raw = training_raw.get("loss_weights", {})
         if loss_weights_raw is None:
             loss_weights_raw = {}
@@ -308,6 +367,37 @@ class RunConfig:
             pin_memory=bool(io_raw.get("pin_memory", True)),
             num_workers=int(io_raw.get("num_workers", 0)),
         )
+        metrics_level = str(metrics_raw.get("level", "standard")).lower()
+        default_metrics_groups = _default_metrics_groups(metrics_level)
+        groups_raw = metrics_raw.get("groups", {})
+        if not isinstance(groups_raw, Mapping):
+            groups_raw = {}
+        metrics_groups = MetricsGroupsConfig(
+            core=_merge_metric_group(groups_raw.get("core", {}), default_metrics_groups.core),
+            throughput=_merge_metric_group(
+                groups_raw.get("throughput", {}),
+                default_metrics_groups.throughput,
+            ),
+            comm_summary=_merge_metric_group(
+                groups_raw.get("comm_summary", {}),
+                default_metrics_groups.comm_summary,
+            ),
+            p2p_detail=_merge_metric_group(
+                groups_raw.get("p2p_detail", {}),
+                default_metrics_groups.p2p_detail,
+            ),
+            io=_merge_metric_group(groups_raw.get("io", {}), default_metrics_groups.io),
+            memory=_merge_metric_group(
+                groups_raw.get("memory", {}),
+                default_metrics_groups.memory,
+            ),
+        )
+        metrics_cfg = MetricsConfig(
+            level=metrics_level,
+            rank_scope=str(metrics_raw.get("rank_scope", "auto")).lower(),
+            log_every_steps=int(metrics_raw.get("log_every_steps", 1)),
+            groups=metrics_groups,
+        )
         training = TrainingConfig(
             global_batch_size=int(training_raw.get("global_batch_size", 256)),
             micro_batch_size=int(training_raw.get("micro_batch_size", 4)),
@@ -328,6 +418,7 @@ class RunConfig:
             loss_weights=loss_weights,
             optimizer=optimizer,
             io=io_cfg,
+            metrics=metrics_cfg,
         )
 
         stages: Dict[str, StageConfig] = {}
@@ -371,6 +462,59 @@ def _validate_modalities(stage_name: str, values: List[str], field_name: str) ->
                 f"stages.{stage_name}.{field_name} contains invalid modality '{value}', "
                 f"expected one of {sorted(VALID_MODALITIES)}"
             )
+
+
+def _default_metrics_config() -> MetricsConfig:
+    return MetricsConfig()
+
+
+def _default_metrics_groups(level: str) -> MetricsGroupsConfig:
+    normalized = level.lower()
+    if normalized in {"detailed", "debug"}:
+        return MetricsGroupsConfig(
+            core=MetricGroupConfig(enabled=True, every_n_steps=1),
+            throughput=MetricGroupConfig(enabled=True, every_n_steps=1),
+            comm_summary=MetricGroupConfig(enabled=True, every_n_steps=1),
+            p2p_detail=MetricGroupConfig(enabled=True, every_n_steps=1),
+            io=MetricGroupConfig(enabled=True, every_n_steps=1),
+            memory=MetricGroupConfig(enabled=True, every_n_steps=1),
+        )
+    if normalized == "minimal":
+        return MetricsGroupsConfig(
+            core=MetricGroupConfig(enabled=True, every_n_steps=1),
+            throughput=MetricGroupConfig(enabled=True, every_n_steps=1),
+            comm_summary=MetricGroupConfig(enabled=False, every_n_steps=1),
+            p2p_detail=MetricGroupConfig(enabled=False, every_n_steps=1),
+            io=MetricGroupConfig(enabled=False, every_n_steps=1),
+            memory=MetricGroupConfig(enabled=False, every_n_steps=1),
+        )
+    if normalized == "off":
+        return MetricsGroupsConfig(
+            core=MetricGroupConfig(enabled=False, every_n_steps=1),
+            throughput=MetricGroupConfig(enabled=False, every_n_steps=1),
+            comm_summary=MetricGroupConfig(enabled=False, every_n_steps=1),
+            p2p_detail=MetricGroupConfig(enabled=False, every_n_steps=1),
+            io=MetricGroupConfig(enabled=False, every_n_steps=1),
+            memory=MetricGroupConfig(enabled=False, every_n_steps=1),
+        )
+    # standard (default): keep throughput + summary + I/O, disable costly p2p/memory.
+    return MetricsGroupsConfig(
+        core=MetricGroupConfig(enabled=True, every_n_steps=1),
+        throughput=MetricGroupConfig(enabled=True, every_n_steps=1),
+        comm_summary=MetricGroupConfig(enabled=True, every_n_steps=1),
+        p2p_detail=MetricGroupConfig(enabled=False, every_n_steps=1),
+        io=MetricGroupConfig(enabled=True, every_n_steps=1),
+        memory=MetricGroupConfig(enabled=False, every_n_steps=1),
+    )
+
+
+def _merge_metric_group(raw: Any, default: MetricGroupConfig) -> MetricGroupConfig:
+    if not isinstance(raw, Mapping):
+        raw = {}
+    return MetricGroupConfig(
+        enabled=bool(raw.get("enabled", default.enabled)),
+        every_n_steps=int(raw.get("every_n_steps", default.every_n_steps)),
+    )
 
 
 def load_config(path: str) -> RunConfig:

@@ -397,6 +397,120 @@ class ConfigTopologyTests(unittest.TestCase):
         with self.assertRaises(ConfigError):
             RunConfig.from_dict(raw)
 
+    def test_metrics_default_level_standard(self) -> None:
+        raw = {
+            "distributed": {"world_size": 1, "backend": "gloo"},
+            "stages": {
+                "encoder": {"enabled": False},
+                "llm": {"enabled": True, "tp_size": 1, "dp_size": 1, "model_cls": "LLMModel"},
+                "decoder": {"enabled": False},
+            },
+            "pipeline": {"schedule": "gpipe", "num_micro_batches": 2},
+            "training": {"micro_batch_size": 2, "hidden_size": 64, "seq_len": 16},
+        }
+        cfg = RunConfig.from_dict(raw)
+        self.assertEqual(cfg.training.metrics.level, "standard")
+        self.assertFalse(cfg.training.metrics.groups.p2p_detail.enabled)
+        self.assertFalse(cfg.training.metrics.groups.memory.enabled)
+        self.assertTrue(cfg.training.metrics.groups.comm_summary.enabled)
+        self.assertEqual(cfg.training.metrics.log_every_steps, 1)
+
+    def test_metrics_group_override_parse(self) -> None:
+        raw = {
+            "distributed": {"world_size": 1, "backend": "gloo"},
+            "stages": {
+                "encoder": {"enabled": False},
+                "llm": {"enabled": True, "tp_size": 1, "dp_size": 1, "model_cls": "LLMModel"},
+                "decoder": {"enabled": False},
+            },
+            "pipeline": {"schedule": "gpipe", "num_micro_batches": 2},
+            "training": {
+                "micro_batch_size": 2,
+                "hidden_size": 64,
+                "seq_len": 16,
+                "metrics": {
+                    "level": "minimal",
+                    "rank_scope": "rank0",
+                    "log_every_steps": 5,
+                    "groups": {
+                        "comm_summary": {"enabled": True, "every_n_steps": 3},
+                        "p2p_detail": {"enabled": True, "every_n_steps": 7},
+                    },
+                },
+            },
+        }
+        cfg = RunConfig.from_dict(raw)
+        self.assertEqual(cfg.training.metrics.level, "minimal")
+        self.assertEqual(cfg.training.metrics.rank_scope, "rank0")
+        self.assertEqual(cfg.training.metrics.log_every_steps, 5)
+        self.assertTrue(cfg.training.metrics.groups.comm_summary.enabled)
+        self.assertEqual(cfg.training.metrics.groups.comm_summary.every_n_steps, 3)
+        self.assertTrue(cfg.training.metrics.groups.p2p_detail.enabled)
+        self.assertEqual(cfg.training.metrics.groups.p2p_detail.every_n_steps, 7)
+
+    def test_metrics_validation(self) -> None:
+        raw = {
+            "distributed": {"world_size": 1, "backend": "gloo"},
+            "stages": {
+                "encoder": {"enabled": False},
+                "llm": {"enabled": True, "tp_size": 1, "dp_size": 1, "model_cls": "LLMModel"},
+                "decoder": {"enabled": False},
+            },
+            "pipeline": {"schedule": "gpipe", "num_micro_batches": 2},
+            "training": {
+                "micro_batch_size": 2,
+                "hidden_size": 64,
+                "seq_len": 16,
+                "metrics": {
+                    "level": "invalid",
+                    "groups": {"core": {"every_n_steps": 0}},
+                },
+            },
+        }
+        with self.assertRaises(ConfigError):
+            RunConfig.from_dict(raw)
+
+    def test_metrics_every_n_validation(self) -> None:
+        raw = {
+            "distributed": {"world_size": 1, "backend": "gloo"},
+            "stages": {
+                "encoder": {"enabled": False},
+                "llm": {"enabled": True, "tp_size": 1, "dp_size": 1, "model_cls": "LLMModel"},
+                "decoder": {"enabled": False},
+            },
+            "pipeline": {"schedule": "gpipe", "num_micro_batches": 2},
+            "training": {
+                "micro_batch_size": 2,
+                "hidden_size": 64,
+                "seq_len": 16,
+                "metrics": {
+                    "level": "standard",
+                    "groups": {"core": {"every_n_steps": 0}},
+                },
+            },
+        }
+        with self.assertRaises(ConfigError):
+            RunConfig.from_dict(raw)
+
+    def test_metrics_rank_scope_validation(self) -> None:
+        raw = {
+            "distributed": {"world_size": 1, "backend": "gloo"},
+            "stages": {
+                "encoder": {"enabled": False},
+                "llm": {"enabled": True, "tp_size": 1, "dp_size": 1, "model_cls": "LLMModel"},
+                "decoder": {"enabled": False},
+            },
+            "pipeline": {"schedule": "gpipe", "num_micro_batches": 2},
+            "training": {
+                "micro_batch_size": 2,
+                "hidden_size": 64,
+                "seq_len": 16,
+                "metrics": {"rank_scope": "middle"},
+            },
+        }
+        with self.assertRaises(ConfigError):
+            RunConfig.from_dict(raw)
+
 
 if __name__ == "__main__":
     unittest.main()

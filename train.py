@@ -156,10 +156,32 @@ def is_log_rank(topology: Topology) -> bool:
     )
 
 
-def should_log_rank(args: argparse.Namespace, topology: Topology) -> bool:
+def is_sink_log_rank(topology: Topology) -> bool:
+    return (
+        topology.local_stage_name == topology.enabled_stage_names[-1]
+        and topology.local_tp_index() == 0
+        and topology.local_dp_index() == 0
+    )
+
+
+def should_log_rank(args: argparse.Namespace, cfg: RunConfig, topology: Topology) -> bool:
     if args.log_all_ranks:
         return True
+    scope = cfg.training.metrics.rank_scope
+    if scope == "all":
+        return True
+    if scope == "rank0":
+        return topology.runtime_rank == 0
+    if scope == "sink":
+        return is_sink_log_rank(topology)
+    # auto: keep historical behavior (rank0 + sink rank).
     return is_log_rank(topology)
+
+
+def metric_group_on_step(cfg: RunConfig, group_name: str, local_step: int) -> bool:
+    group_cfg = getattr(cfg.training.metrics.groups, group_name)
+    every = max(int(group_cfg.every_n_steps), 1)
+    return bool(group_cfg.enabled and (local_step % every == 0))
 
 
 def rank_log_file_path(base_path: str, rank: int, log_all_ranks: bool) -> Path:
@@ -243,7 +265,7 @@ def main() -> int:
             topology,
             restore_rng=not args.no_restore_rng,
         )
-        if should_log_rank(args, topology):
+        if should_log_rank(args, cfg, topology):
             print(f"[INFO][rank={rank}] resumed from {args.resume}, step={start_step}")
 
     engine = TrainingEngine(
@@ -261,100 +283,146 @@ def main() -> int:
         max_steps = start_step + 1
 
     log_fp = None
-    if args.log_file and should_log_rank(args, topology):
-        log_path = rank_log_file_path(args.log_file, rank, args.log_all_ranks)
+    log_on_all_ranks = args.log_all_ranks or cfg.training.metrics.rank_scope == "all"
+    if args.log_file and should_log_rank(args, cfg, topology):
+        log_path = rank_log_file_path(args.log_file, rank, log_on_all_ranks)
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_fp = log_path.open("a", encoding="utf-8")
 
     metrics = engine.run(max_steps=max_steps - start_step)
-    if should_log_rank(args, topology):
+    if should_log_rank(args, cfg, topology):
         sp_enabled = bool(
             cfg.stages[topology.local_stage_name].sequence_parallel
             and topology.local_stage.tp_size > 1
         )
         for m in metrics:
+            global_step = start_step + m.step
+            if global_step % max(int(cfg.training.metrics.log_every_steps), 1) != 0:
+                continue
+            core_on = metric_group_on_step(cfg, "core", m.step)
+            throughput_on = metric_group_on_step(cfg, "throughput", m.step)
+            comm_summary_on = metric_group_on_step(cfg, "comm_summary", m.step)
+            p2p_on = metric_group_on_step(cfg, "p2p_detail", m.step)
+            io_on = metric_group_on_step(cfg, "io", m.step)
+            memory_on = metric_group_on_step(cfg, "memory", m.step)
             payload = {
-                "step": start_step + m.step,
+                "step": global_step,
                 "rank": rank,
                 "stage": topology.local_stage_name,
                 "local_tp_idx": topology.local_tp_index(),
                 "local_dp_idx": topology.local_dp_index(),
                 "sequence_parallel": sp_enabled,
-                "loss": m.loss,
-                "step_time_sec": m.step_time_sec,
-                "forward_time_sec": m.forward_time_sec,
-                "backward_time_sec": m.backward_time_sec,
-                "tokens_per_sec": m.tokens_per_sec,
-                "samples_per_sec": m.samples_per_sec,
-                "bubble_ratio": m.bubble_ratio,
-                "comm_time_sec": m.comm_time_sec,
-                "comm_bytes_mb": m.comm_bytes_mb,
-                "comm_bandwidth_mb_s": m.comm_bandwidth_mb_s,
-                "comm_allreduce_sec": m.comm_allreduce_sec,
-                "comm_allreduce_mb": m.comm_allreduce_mb,
-                "dataloader_wait_sec": m.dataloader_wait_sec,
-                "host_to_device_sec": m.host_to_device_sec,
-                "comm_activation_send_sec": m.comm_activation_send_sec,
-                "comm_activation_recv_sec": m.comm_activation_recv_sec,
-                "comm_gradient_send_sec": m.comm_gradient_send_sec,
-                "comm_gradient_recv_sec": m.comm_gradient_recv_sec,
-                "comm_wait_sec": m.comm_wait_sec,
-                "comm_p2p_send_launch_sec": m.comm_p2p_send_launch_sec,
-                "comm_p2p_recv_launch_sec": m.comm_p2p_recv_launch_sec,
-                "comm_p2p_recv_wait_sec": m.comm_p2p_recv_wait_sec,
-                "comm_p2p_send_wait_sec": m.comm_p2p_send_wait_sec,
-                "comm_p2p_prepost_posted": m.comm_p2p_prepost_posted,
-                "comm_p2p_prepost_hits": m.comm_p2p_prepost_hits,
-                "comm_p2p_prepost_misses": m.comm_p2p_prepost_misses,
-                "comm_p2p_prepost_hit_rate": m.comm_p2p_prepost_hit_rate,
-                "comm_p2p_recv_overlap_est_sec": m.comm_p2p_recv_overlap_est_sec,
-                "comm_p2p_recv_overlap_ratio": m.comm_p2p_recv_overlap_ratio,
-                "gpu_mem_peak_mb": m.gpu_mem_peak_mb,
-                "grad_norm": m.grad_norm,
-                "lr": m.lr,
-                "scaler_scale": m.scaler_scale,
-                "sync_impl": m.sync_impl,
                 "optimizer_step": m.optimizer_stepped,
+                "metrics_core_sampled": core_on,
+                "metrics_throughput_sampled": throughput_on,
+                "metrics_comm_summary_sampled": comm_summary_on,
+                "metrics_p2p_detail_sampled": p2p_on,
+                "metrics_io_sampled": io_on,
+                "metrics_memory_sampled": memory_on,
             }
+            if core_on:
+                payload.update(
+                    {
+                        "loss": m.loss,
+                        "grad_norm": m.grad_norm,
+                        "lr": m.lr,
+                        "scaler_scale": m.scaler_scale,
+                        "sync_impl": m.sync_impl,
+                    }
+                )
+            if throughput_on:
+                payload.update(
+                    {
+                        "step_time_sec": m.step_time_sec,
+                        "forward_time_sec": m.forward_time_sec,
+                        "backward_time_sec": m.backward_time_sec,
+                        "tokens_per_sec": m.tokens_per_sec,
+                        "samples_per_sec": m.samples_per_sec,
+                        "bubble_ratio": m.bubble_ratio,
+                    }
+                )
+            if comm_summary_on:
+                payload.update(
+                    {
+                        "comm_time_sec": m.comm_time_sec,
+                        "comm_bytes_mb": m.comm_bytes_mb,
+                        "comm_bandwidth_mb_s": m.comm_bandwidth_mb_s,
+                        "comm_allreduce_sec": m.comm_allreduce_sec,
+                        "comm_allreduce_mb": m.comm_allreduce_mb,
+                    }
+                )
+            if io_on:
+                payload.update(
+                    {
+                        "dataloader_wait_sec": m.dataloader_wait_sec,
+                        "host_to_device_sec": m.host_to_device_sec,
+                    }
+                )
+            if p2p_on:
+                payload.update(
+                    {
+                        "comm_activation_send_sec": m.comm_activation_send_sec,
+                        "comm_activation_recv_sec": m.comm_activation_recv_sec,
+                        "comm_gradient_send_sec": m.comm_gradient_send_sec,
+                        "comm_gradient_recv_sec": m.comm_gradient_recv_sec,
+                        "comm_wait_sec": m.comm_wait_sec,
+                        "comm_p2p_send_launch_sec": m.comm_p2p_send_launch_sec,
+                        "comm_p2p_recv_launch_sec": m.comm_p2p_recv_launch_sec,
+                        "comm_p2p_recv_wait_sec": m.comm_p2p_recv_wait_sec,
+                        "comm_p2p_send_wait_sec": m.comm_p2p_send_wait_sec,
+                        "comm_p2p_prepost_posted": m.comm_p2p_prepost_posted,
+                        "comm_p2p_prepost_hits": m.comm_p2p_prepost_hits,
+                        "comm_p2p_prepost_misses": m.comm_p2p_prepost_misses,
+                        "comm_p2p_prepost_hit_rate": m.comm_p2p_prepost_hit_rate,
+                        "comm_p2p_recv_overlap_est_sec": m.comm_p2p_recv_overlap_est_sec,
+                        "comm_p2p_recv_overlap_ratio": m.comm_p2p_recv_overlap_ratio,
+                    }
+                )
+            if memory_on:
+                payload["gpu_mem_peak_mb"] = m.gpu_mem_peak_mb
+
             if args.log_format == "json":
                 print(json.dumps(payload, ensure_ascii=False))
             else:
-                print(
-                    "[step={:04d}] loss={:.6f} step_time={:.3f}s fwd={:.3f}s bwd={:.3f}s "
-                    "tokens/s={:.1f} samples/s={:.1f} comm={:.3f}s "
-                    "io(wait={:.3f},h2d={:.3f}) "
-                    "(allr={:.3f},act_s={:.3f},act_r={:.3f},grad_s={:.3f},grad_r={:.3f},wait={:.3f}) "
-                    "p2p(hit={:.2f},ovlp={:.2f},recv_wait={:.3f},send_wait={:.3f}) "
-                    "bw={:.2f}MB/s grad_norm={} lr={:.6g} scaler={} sync={} bubble={:.4f} optimizer_step={}".format(
-                        payload["step"],
-                        m.loss,
-                        m.step_time_sec,
-                        m.forward_time_sec,
-                        m.backward_time_sec,
-                        m.tokens_per_sec,
-                        m.samples_per_sec,
-                        m.comm_time_sec,
-                        m.dataloader_wait_sec,
-                        m.host_to_device_sec,
-                        m.comm_allreduce_sec,
-                        m.comm_activation_send_sec,
-                        m.comm_activation_recv_sec,
-                        m.comm_gradient_send_sec,
-                        m.comm_gradient_recv_sec,
-                        m.comm_wait_sec,
-                        m.comm_p2p_prepost_hit_rate,
-                        m.comm_p2p_recv_overlap_ratio,
-                        m.comm_p2p_recv_wait_sec,
-                        m.comm_p2p_send_wait_sec,
-                        m.comm_bandwidth_mb_s,
-                        "n/a" if m.grad_norm is None else f"{m.grad_norm:.4f}",
-                        m.lr,
-                        "n/a" if m.scaler_scale is None else f"{m.scaler_scale:.1f}",
-                        m.sync_impl,
-                        m.bubble_ratio,
-                        m.optimizer_stepped,
+                parts = [f"[step={global_step:04d}]"]
+                if core_on:
+                    parts.append(f"loss={m.loss:.6f}")
+                    parts.append(
+                        "grad_norm=" + ("n/a" if m.grad_norm is None else f"{m.grad_norm:.4f}")
                     )
-                )
+                    parts.append(f"lr={m.lr:.6g}")
+                    parts.append(
+                        "scaler=" + ("n/a" if m.scaler_scale is None else f"{m.scaler_scale:.1f}")
+                    )
+                    parts.append(f"sync={m.sync_impl}")
+                if throughput_on:
+                    parts.append(f"step_time={m.step_time_sec:.3f}s")
+                    parts.append(f"fwd={m.forward_time_sec:.3f}s")
+                    parts.append(f"bwd={m.backward_time_sec:.3f}s")
+                    parts.append(f"tokens/s={m.tokens_per_sec:.1f}")
+                    parts.append(f"samples/s={m.samples_per_sec:.1f}")
+                    parts.append(f"bubble={m.bubble_ratio:.4f}")
+                if comm_summary_on:
+                    parts.append(f"comm={m.comm_time_sec:.3f}s")
+                    parts.append(f"allr={m.comm_allreduce_sec:.3f}s")
+                    parts.append(f"bw={m.comm_bandwidth_mb_s:.2f}MB/s")
+                if io_on:
+                    parts.append(f"io(wait={m.dataloader_wait_sec:.3f},h2d={m.host_to_device_sec:.3f})")
+                if p2p_on:
+                    parts.append(
+                        "p2p("
+                        f"act_s={m.comm_activation_send_sec:.3f},"
+                        f"act_r={m.comm_activation_recv_sec:.3f},"
+                        f"grad_s={m.comm_gradient_send_sec:.3f},"
+                        f"grad_r={m.comm_gradient_recv_sec:.3f},"
+                        f"wait={m.comm_wait_sec:.3f},"
+                        f"hit={m.comm_p2p_prepost_hit_rate:.2f},"
+                        f"ovlp={m.comm_p2p_recv_overlap_ratio:.2f})"
+                    )
+                if memory_on:
+                    parts.append(f"mem_peak={m.gpu_mem_peak_mb:.2f}MB")
+                parts.append(f"optimizer_step={m.optimizer_stepped}")
+                print(" ".join(parts))
             if log_fp is not None:
                 log_fp.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
@@ -376,7 +444,7 @@ def main() -> int:
             config=cfg,
             topology=topology,
         )
-        if should_log_rank(args, topology):
+        if should_log_rank(args, cfg, topology):
             print(f"[INFO][rank={rank}] checkpoint saved: {ckpt_path}")
 
     group_manager.clear()

@@ -197,6 +197,22 @@ python train.py --config configs/text_llm_only_local.yaml --deterministic
 - `training.deterministic`：是否启用确定性模式（默认 `false`）
   - 开启后会设置 `torch.use_deterministic_algorithms(True)`、`cudnn.deterministic=True`、
     `cudnn.benchmark=False`、关闭 TF32，并设置 `CUBLAS_WORKSPACE_CONFIG=:4096:8`
+- `training.metrics`：指标采集/输出控制（用于降低 profiling 对训练性能的影响）
+  - `level`：`off/minimal/standard/detailed/debug`（默认 `standard`）
+  - `rank_scope`：`auto/rank0/sink/all`（默认 `auto`，与历史行为兼容）
+  - `log_every_steps`：日志输出步频（默认 `1`）
+  - `groups`：按组开关与采样步频（`enabled` + `every_n_steps`），支持：
+    - `core`：loss/lr/grad_norm/scaler/sync_impl
+    - `throughput`：step/fwd/bwd/tokens/samples/bubble
+    - `comm_summary`：comm 总量与 all-reduce 汇总
+    - `p2p_detail`：act/grad 通道与 prepost/overlap 细粒度指标
+    - `io`：dataloader wait / h2d
+    - `memory`：gpu peak memory
+  - 默认 level 行为：
+    - `minimal`：仅 core + throughput
+    - `standard`：core + throughput + comm_summary + io（默认，关闭 p2p_detail/memory）
+    - `detailed/debug`：全部开启
+    - `off`：全部关闭
 - `training.optimizer.zero_stage`：优化器分片等级，当前支持：
   - `0`：常规 AdamW（默认）
   - `1`：ZeRO-1 Distributed Optimizer（连续参数/主梯度 buffer + `reduce_scatter/all_gather`）
