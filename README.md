@@ -122,6 +122,12 @@ Transport dtype 对比基线（`pipeline.transport_dtype=fp32` vs `auto`）：
 bash scripts/run_benchmark_transport_dtype_compare.sh
 ```
 
+TP 边界传输模式对比（`pipeline.transport_tp_mode=single` vs `auto`）：
+
+```bash
+bash scripts/run_benchmark_tp_transport_mode_compare.sh
+```
+
 SP 基线对比（LLM 阶段，`sequence_parallel on/off` 自动对比并导出报告）：
 
 ```bash
