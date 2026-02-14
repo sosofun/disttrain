@@ -215,32 +215,64 @@ class ProcessGroupManager:
         if current:
             buckets.append(current)
 
+        pending: Optional[Tuple[List[torch.Tensor], torch.Tensor, dist.Work, bool]] = None
+
+        def _finish_pending(
+            item: Tuple[List[torch.Tensor], torch.Tensor, dist.Work, bool]
+        ) -> None:
+            nonlocal stats
+            bucket_grads, buf, work, is_flat = item
+            t_wait = time.perf_counter()
+            work.wait()
+            waited = time.perf_counter() - t_wait
+            stats["time_sec"] += waited
+            if is_flat:
+                buf /= divisor
+                offset = 0
+                for grad in bucket_grads:
+                    n = grad.numel()
+                    grad.copy_(buf[offset : offset + n].view_as(grad))
+                    offset += n
+            else:
+                bucket_grads[0] /= divisor
+
         for bucket in buckets:
             if len(bucket) == 1:
-                grad = bucket[0]
-                t0 = time.perf_counter()
-                dist.all_reduce(grad, op=dist.ReduceOp.SUM, group=group)
-                grad /= divisor
-                stats["time_sec"] += time.perf_counter() - t0
-                stats["bytes_mb"] += float(grad.numel() * grad.element_size()) / (
+                launch_buf = bucket[0]
+                stats["bytes_mb"] += float(launch_buf.numel() * launch_buf.element_size()) / (
                     1024.0 * 1024.0
                 )
-                continue
+                t0 = time.perf_counter()
+                work = dist.all_reduce(
+                    launch_buf,
+                    op=dist.ReduceOp.SUM,
+                    group=group,
+                    async_op=True,
+                )
+                stats["time_sec"] += time.perf_counter() - t0
+                new_pending = (bucket, launch_buf, work, False)
+            else:
+                flat = torch.cat([g.reshape(-1) for g in bucket], dim=0)
+                stats["bytes_mb"] += float(flat.numel() * flat.element_size()) / (
+                    1024.0 * 1024.0
+                )
+                t0 = time.perf_counter()
+                work = dist.all_reduce(
+                    flat,
+                    op=dist.ReduceOp.SUM,
+                    group=group,
+                    async_op=True,
+                )
+                stats["time_sec"] += time.perf_counter() - t0
+                new_pending = (bucket, flat, work, True)
 
-            flat = torch.cat([g.reshape(-1) for g in bucket], dim=0)
-            t0 = time.perf_counter()
-            dist.all_reduce(flat, op=dist.ReduceOp.SUM, group=group)
-            flat /= divisor
-            stats["time_sec"] += time.perf_counter() - t0
-            stats["bytes_mb"] += float(flat.numel() * flat.element_size()) / (
-                1024.0 * 1024.0
-            )
+            # Keep one bucket in flight while launching the next one.
+            if pending is not None:
+                _finish_pending(pending)
+            pending = new_pending
 
-            offset = 0
-            for grad in bucket:
-                n = grad.numel()
-                grad.copy_(flat[offset : offset + n].view_as(grad))
-                offset += n
+        if pending is not None:
+            _finish_pending(pending)
         return stats
 
     def clear(self) -> None:
