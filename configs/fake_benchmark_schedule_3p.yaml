@@ -1,0 +1,57 @@
+distributed:
+  backend: gloo
+  world_size: 3
+  init_method: env://
+  timeout_sec: 1800
+  grad_sync_bucket_mb: 8
+
+stages:
+  encoder:
+    enabled: true
+    tp_size: 1
+    dp_size: 1
+    model_cls: EncoderModel
+    input_modalities: [image, audio]
+    activation_checkpoint: false
+  llm:
+    enabled: true
+    tp_size: 1
+    dp_size: 1
+    model_cls: LLMModel
+    activation_checkpoint: false
+  decoder:
+    enabled: true
+    tp_size: 1
+    dp_size: 1
+    model_cls: DecoderModel
+    output_modalities: [audio]
+    activation_checkpoint: false
+
+pipeline:
+  schedule: 1f1b
+  num_micro_batches: 4
+  overlap_p2p_comm: false
+
+training:
+  global_batch_size: 48
+  micro_batch_size: 2
+  grad_accum_steps: 1
+  grad_clip_norm: 1.0
+  precision: fp32
+  device: cpu
+  data_seed: 2026
+  max_steps: 8
+  seq_len: 32
+  vocab_size: 2048
+  hidden_size: 128
+  image_size: 16
+  audio_length: 256
+  io:
+    enable_prefetch: true
+    prefetch_size: 2
+    pin_memory: true
+    num_workers: 0
+  optimizer:
+    type: adamw
+    lr: 1.0e-3
+    weight_decay: 0.01

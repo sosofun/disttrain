@@ -1,0 +1,46 @@
+distributed:
+  backend: nccl
+  world_size: 16
+  init_method: env://
+  timeout_sec: 1800
+
+stages:
+  encoder:
+    enabled: true
+    tp_size: 2
+    dp_size: 2
+    model_cls: EncoderModel
+    input_modalities: [image, video, audio]
+  llm:
+    enabled: true
+    tp_size: 4
+    dp_size: 2
+    model_cls: LLMModel
+  decoder:
+    enabled: true
+    tp_size: 2
+    dp_size: 2
+    model_cls: DecoderModel
+    output_modalities: [image, audio]
+
+pipeline:
+  schedule: 1f1b
+  num_micro_batches: 8
+  overlap_p2p_comm: true
+
+training:
+  global_batch_size: 256
+  micro_batch_size: 4
+  grad_accum_steps: 8
+  precision: bf16
+  max_steps: 100
+  seq_len: 128
+  vocab_size: 32000
+  hidden_size: 512
+  image_size: 64
+  video_frames: 8
+  audio_length: 2048
+  optimizer:
+    type: adamw
+    lr: 2.0e-4
+    weight_decay: 0.01
