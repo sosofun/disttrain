@@ -121,6 +121,9 @@ def avg(rows, key):
     vals = [float(r.get(key, 0.0)) for r in rows]
     return statistics.fmean(vals) if vals else 0.0
 
+def sumv(rows, key):
+    return float(sum(float(r.get(key, 0.0)) for r in rows))
+
 summary = {}
 for mode, path in files.items():
     if not path.exists():
@@ -134,6 +137,15 @@ for mode, path in files.items():
         "avg_tokens_per_sec": avg(rows, "tokens_per_sec"),
         "avg_comm_time_sec": avg(rows, "comm_time_sec"),
         "avg_comm_bytes_mb": avg(rows, "comm_bytes_mb"),
+        "avg_p2p_prepost_hit_rate": avg(rows, "comm_p2p_prepost_hit_rate"),
+        "avg_p2p_recv_overlap_ratio": avg(rows, "comm_p2p_recv_overlap_ratio"),
+        "avg_p2p_recv_wait_sec": avg(rows, "comm_p2p_recv_wait_sec"),
+        "avg_p2p_send_wait_sec": avg(rows, "comm_p2p_send_wait_sec"),
+        "avg_p2p_recv_launch_sec": avg(rows, "comm_p2p_recv_launch_sec"),
+        "avg_p2p_send_launch_sec": avg(rows, "comm_p2p_send_launch_sec"),
+        "sum_p2p_prepost_hits": sumv(rows, "comm_p2p_prepost_hits"),
+        "sum_p2p_prepost_misses": sumv(rows, "comm_p2p_prepost_misses"),
+        "sum_p2p_prepost_posted": sumv(rows, "comm_p2p_prepost_posted"),
     }
 
 single = summary["single"]
@@ -150,6 +162,21 @@ report = {
     ),
     "ratio_auto_vs_single_comm_time": (
         auto["avg_comm_time_sec"] / single["avg_comm_time_sec"] if single["avg_comm_time_sec"] > 0 else 0.0
+    ),
+    "ratio_auto_vs_single_p2p_prepost_hit_rate": (
+        auto["avg_p2p_prepost_hit_rate"] / single["avg_p2p_prepost_hit_rate"]
+        if single["avg_p2p_prepost_hit_rate"] > 0
+        else 0.0
+    ),
+    "ratio_auto_vs_single_p2p_recv_overlap_ratio": (
+        auto["avg_p2p_recv_overlap_ratio"] / single["avg_p2p_recv_overlap_ratio"]
+        if single["avg_p2p_recv_overlap_ratio"] > 0
+        else 0.0
+    ),
+    "ratio_auto_vs_single_p2p_recv_wait_sec": (
+        auto["avg_p2p_recv_wait_sec"] / single["avg_p2p_recv_wait_sec"]
+        if single["avg_p2p_recv_wait_sec"] > 0
+        else 0.0
     ),
 }
 
@@ -171,9 +198,18 @@ md.append(f"| avg_step_time_sec | {single['avg_step_time_sec']:.6f} | {auto['avg
 md.append(f"| avg_tokens_per_sec | {single['avg_tokens_per_sec']:.2f} | {auto['avg_tokens_per_sec']:.2f} | {report['ratio_auto_vs_single_tokens_per_sec']:.4f} |")
 md.append(f"| avg_comm_time_sec | {single['avg_comm_time_sec']:.6f} | {auto['avg_comm_time_sec']:.6f} | {report['ratio_auto_vs_single_comm_time']:.4f} |")
 md.append(f"| avg_comm_bytes_mb | {single['avg_comm_bytes_mb']:.4f} | {auto['avg_comm_bytes_mb']:.4f} | - |")
+md.append(f"| avg_p2p_prepost_hit_rate | {single['avg_p2p_prepost_hit_rate']:.4f} | {auto['avg_p2p_prepost_hit_rate']:.4f} | {report['ratio_auto_vs_single_p2p_prepost_hit_rate']:.4f} |")
+md.append(f"| avg_p2p_recv_overlap_ratio | {single['avg_p2p_recv_overlap_ratio']:.4f} | {auto['avg_p2p_recv_overlap_ratio']:.4f} | {report['ratio_auto_vs_single_p2p_recv_overlap_ratio']:.4f} |")
+md.append(f"| avg_p2p_recv_wait_sec | {single['avg_p2p_recv_wait_sec']:.6f} | {auto['avg_p2p_recv_wait_sec']:.6f} | {report['ratio_auto_vs_single_p2p_recv_wait_sec']:.4f} |")
+md.append(f"| avg_p2p_send_wait_sec | {single['avg_p2p_send_wait_sec']:.6f} | {auto['avg_p2p_send_wait_sec']:.6f} | - |")
+md.append(f"| avg_p2p_recv_launch_sec | {single['avg_p2p_recv_launch_sec']:.6f} | {auto['avg_p2p_recv_launch_sec']:.6f} | - |")
+md.append(f"| avg_p2p_send_launch_sec | {single['avg_p2p_send_launch_sec']:.6f} | {auto['avg_p2p_send_launch_sec']:.6f} | - |")
 md.append("")
 md.append(f"- records(single): {single['records']}")
 md.append(f"- records(auto): {auto['records']}")
+md.append(f"- prepost hits(single/auto): {single['sum_p2p_prepost_hits']:.0f} / {auto['sum_p2p_prepost_hits']:.0f}")
+md.append(f"- prepost misses(single/auto): {single['sum_p2p_prepost_misses']:.0f} / {auto['sum_p2p_prepost_misses']:.0f}")
+md.append(f"- prepost posted(single/auto): {single['sum_p2p_prepost_posted']:.0f} / {auto['sum_p2p_prepost_posted']:.0f}")
 
 md_path = log_dir / "tp_transport_mode_compare_report.md"
 md_path.write_text("\n".join(md) + "\n", encoding="utf-8")

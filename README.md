@@ -135,6 +135,8 @@ TP 边界传输模式对比（`pipeline.transport_tp_mode=single` vs `auto`）�
 bash scripts/run_benchmark_tp_transport_mode_compare.sh
 ```
 
+该报告会同时输出 `prepost hit rate` 与 `recv overlap ratio`，用于判断吞吐变化是否来自真实通信重叠。
+
 SP 基线对比（LLM 阶段，`sequence_parallel on/off` 自动对比并导出报告）：
 
 ```bash
