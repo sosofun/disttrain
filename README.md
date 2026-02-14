@@ -62,6 +62,21 @@ torchrun --nproc_per_node=4 train.py --config configs/fake_tri_stage_gpu_metrics
 
 # tri-stage GPU 诊断（全 rank + p2p detail + memory）
 torchrun --nproc_per_node=4 train.py --config configs/fake_tri_stage_gpu_metrics_diagnose.yaml --log-format json
+
+# tri-stage CPU 基准
+torchrun --nproc_per_node=3 train.py --config configs/fake_tri_stage_cpu_metrics_benchmark.yaml
+
+# tri-stage CPU 诊断
+torchrun --nproc_per_node=3 train.py --config configs/fake_tri_stage_cpu_metrics_diagnose.yaml --log-format json
+```
+
+一键跑 metrics profile 回归（2p + tri-stage CPU）：
+
+```bash
+bash scripts/run_e2e_metrics_profiles.sh
+
+# 常用参数
+STEPS=6 RUN_DIAGNOSE=0 FORCE_CPU=1 bash scripts/run_e2e_metrics_profiles.sh
 ```
 
 支持 JSON 日志格式（便于接入监控）：
