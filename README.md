@@ -48,6 +48,22 @@ python train.py --config configs/fake_llm_local_metrics_benchmark.yaml
 python train.py --config configs/fake_llm_local_metrics_diagnose.yaml --log-format json
 ```
 
+分布式模板（2p / tri-stage）：
+
+```bash
+# 2p LLM-only 低开销训练日志
+torchrun --nproc_per_node=2 train.py --config configs/fake_e2e_llm_only_2p_metrics_train.yaml
+
+# 2p LLM-only 诊断
+torchrun --nproc_per_node=2 train.py --config configs/fake_e2e_llm_only_2p_metrics_diagnose.yaml --log-format json
+
+# tri-stage GPU 基准
+torchrun --nproc_per_node=4 train.py --config configs/fake_tri_stage_gpu_metrics_benchmark.yaml
+
+# tri-stage GPU 诊断（全 rank + p2p detail + memory）
+torchrun --nproc_per_node=4 train.py --config configs/fake_tri_stage_gpu_metrics_diagnose.yaml --log-format json
+```
+
 支持 JSON 日志格式（便于接入监控）：
 
 ```bash
