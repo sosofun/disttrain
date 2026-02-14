@@ -347,6 +347,7 @@ class Zero1AdamW(Optimizer):
         weight_decay: float = 0.0,
         dp_group: Optional[dist.ProcessGroup] = None,
         dp_global_ranks: Optional[List[int]] = None,
+        zero1_bucket_mb: float = 0.0,
     ):
         defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
         super().__init__(params, defaults)
@@ -370,7 +371,16 @@ class Zero1AdamW(Optimizer):
 
         self._validate_params(self._params)
         self._device = self._params[0].device
-        dtype_groups = self._group_params_by_dtype(self._params)
+        self._zero1_bucket_mb = max(float(zero1_bucket_mb), 0.0)
+        max_bucket_numel = (
+            int(self._zero1_bucket_mb * 1024.0 * 1024.0 / 4.0)
+            if self._zero1_bucket_mb > 0
+            else 0
+        )
+        dtype_groups = self._group_params_by_dtype(
+            self._params,
+            max_bucket_numel=max_bucket_numel,
+        )
         # Build one buffer bucket per dtype to keep mixed-precision storage simple.
         self._buckets: List[_BufferBucket] = [
             _BufferBucket(
@@ -398,6 +408,7 @@ class Zero1AdamW(Optimizer):
     @staticmethod
     def _group_params_by_dtype(
         params: List[torch.nn.Parameter],
+        max_bucket_numel: int = 0,
     ) -> List[Tuple[torch.dtype, List[torch.nn.Parameter]]]:
         groups: Dict[torch.dtype, List[torch.nn.Parameter]] = {}
         order: List[torch.dtype] = []
@@ -406,7 +417,26 @@ class Zero1AdamW(Optimizer):
                 groups[p.dtype] = []
                 order.append(p.dtype)
             groups[p.dtype].append(p)
-        return [(dtype, groups[dtype]) for dtype in order]
+
+        out: List[Tuple[torch.dtype, List[torch.nn.Parameter]]] = []
+        for dtype in order:
+            items = groups[dtype]
+            if max_bucket_numel <= 0:
+                out.append((dtype, items))
+                continue
+            cur: List[torch.nn.Parameter] = []
+            cur_numel = 0
+            for p in items:
+                n = p.numel()
+                if cur and cur_numel + n > max_bucket_numel:
+                    out.append((dtype, cur))
+                    cur = []
+                    cur_numel = 0
+                cur.append(p)
+                cur_numel += n
+            if cur:
+                out.append((dtype, cur))
+        return out
 
     def zero_grad(self, set_to_none: bool = True) -> None:  # type: ignore[override]
         super().zero_grad(set_to_none=set_to_none)
@@ -505,7 +535,14 @@ class Zero1AdamW(Optimizer):
         base = super().state_dict()
         base["dist_optim"] = {
             "step": int(self._step),
-            "buckets": [bucket.export_state() for bucket in self._buckets],
+            "zero1_bucket_mb": float(self._zero1_bucket_mb),
+            "buckets": [
+                {
+                    "bucket_index": idx,
+                    **bucket.export_state(),
+                }
+                for idx, bucket in enumerate(self._buckets)
+            ],
         }
         return base
 
@@ -522,22 +559,49 @@ class Zero1AdamW(Optimizer):
         self._step = int(dist_state.get("step", 0))
         saved_buckets = dist_state.get("buckets")
         if isinstance(saved_buckets, list):
-            saved_map: Dict[Tuple[str, int], Dict[str, object]] = {}
-            for item in saved_buckets:
-                if not isinstance(item, dict):
-                    continue
+            items = [x for x in saved_buckets if isinstance(x, dict)]
+            if items and all("bucket_index" in x for x in items):
+                items = sorted(items, key=lambda x: int(x.get("bucket_index", -1)))
+                if len(items) != len(self._buckets):
+                    raise ValueError(
+                        "checkpoint optimizer bucket count mismatch: "
+                        f"ckpt={len(items)}, runtime={len(self._buckets)}"
+                    )
+                for idx, bucket in enumerate(self._buckets):
+                    saved = items[idx]
+                    if (
+                        str(saved.get("dtype")) != str(bucket.dtype)
+                        or int(saved.get("numel", -1)) != int(bucket.numel)
+                    ):
+                        raise ValueError(
+                            "checkpoint optimizer bucket mismatch at index "
+                            f"{idx}: ckpt(dtype,numel)=({saved.get('dtype')},"
+                            f"{saved.get('numel')}), runtime(dtype,numel)=({bucket.dtype},"
+                            f"{bucket.numel})"
+                        )
+                    bucket.load_state(
+                        saved,
+                        distributed=self._distributed,
+                        dp_group=self.dp_group,
+                    )
+                return
+
+            # Backward-compatible matching: allow duplicate bucket shapes by
+            # consuming a queue per (dtype, numel) key.
+            legacy_map: Dict[Tuple[str, int], List[Dict[str, object]]] = {}
+            for item in items:
                 key = (str(item.get("dtype")), int(item.get("numel", -1)))
-                saved_map[key] = item
+                legacy_map.setdefault(key, []).append(item)
 
             for bucket in self._buckets:
-                # Match by (dtype, numel) so bucket order changes won't break restore.
                 key = (str(bucket.dtype), int(bucket.numel))
-                saved = saved_map.get(key)
-                if saved is None:
+                queue = legacy_map.get(key, [])
+                if not queue:
                     raise ValueError(
                         "checkpoint optimizer bucket mismatch for dtype/numel: "
                         f"dtype={bucket.dtype}, numel={bucket.numel}"
                     )
+                saved = queue.pop(0)
                 bucket.load_state(
                     saved,
                     distributed=self._distributed,

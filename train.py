@@ -411,13 +411,16 @@ def _build_optimizer(
                 weight_decay=cfg.training.optimizer.weight_decay,
                 dp_group=dp_group,
                 dp_global_ranks=_dp_group_global_ranks(topology),
+                zero1_bucket_mb=cfg.training.optimizer.zero1_bucket_mb,
             )
             if topology.runtime_rank == 0:
                 print(
-                    "[INFO] enabled ZeRO-1 distributed optimizer for stage={}, dp={}, tp={}".format(
+                    "[INFO] enabled ZeRO-1 distributed optimizer for stage={}, dp={}, tp={}, "
+                    "zero1_bucket_mb={}".format(
                         topology.local_stage_name,
                         topology.local_stage.dp_size,
                         topology.local_stage.tp_size,
+                        cfg.training.optimizer.zero1_bucket_mb,
                     )
                 )
             return optimizer

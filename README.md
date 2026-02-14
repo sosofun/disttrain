@@ -116,6 +116,12 @@ GPipe vs 1F1B 自动基线对比（导出 json + md 报告）：
 bash scripts/run_benchmark_schedule_compare.sh
 ```
 
+Transport dtype 对比基线（`pipeline.transport_dtype=fp32` vs `auto`）：
+
+```bash
+bash scripts/run_benchmark_transport_dtype_compare.sh
+```
+
 SP 基线对比（LLM 阶段，`sequence_parallel on/off` 自动对比并导出报告）：
 
 ```bash
@@ -175,6 +181,8 @@ python train.py --config configs/text_llm_only_local.yaml --deterministic
 - `training.optimizer.zero_stage`：优化器分片等级，当前支持：
   - `0`：常规 AdamW（默认）
   - `1`：ZeRO-1 Distributed Optimizer（连续参数/主梯度 buffer + `reduce_scatter/all_gather`）
+- `training.optimizer.zero1_bucket_mb`：ZeRO-1 桶粒度（MB，默认 `0` 表示按 dtype 合并成大桶）
+  - 该值越小，桶越细，通信/计算 overlap 潜力更高，但 collective 次数更多
 - `training.loss_weights`：多任务损失权重，支持键：`text/image/audio`，示例：
 
 ```yaml

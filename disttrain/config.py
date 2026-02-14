@@ -59,6 +59,7 @@ class OptimizerConfig:
     weight_decay: float = 0.01
     stage_lrs: Dict[str, float] = field(default_factory=dict)
     zero_stage: int = 0
+    zero1_bucket_mb: float = 0.0
 
 
 @dataclass
@@ -216,6 +217,8 @@ class RunConfig:
                 "training.optimizer.zero_stage must be 0 or 1, "
                 f"got {self.training.optimizer.zero_stage}"
             )
+        if self.training.optimizer.zero1_bucket_mb < 0:
+            raise ConfigError("training.optimizer.zero1_bucket_mb must be >= 0")
         for stage_name in STAGE_ORDER:
             stage = self.stages[stage_name]
             if not stage.enabled:
@@ -277,6 +280,7 @@ class RunConfig:
                 for k, v in (optimizer_raw.get("stage_lrs", {}) or {}).items()
             },
             zero_stage=int(optimizer_raw.get("zero_stage", 0)),
+            zero1_bucket_mb=float(optimizer_raw.get("zero1_bucket_mb", 0.0)),
         )
         io_cfg = IOConfig(
             enable_prefetch=bool(io_raw.get("enable_prefetch", True)),
